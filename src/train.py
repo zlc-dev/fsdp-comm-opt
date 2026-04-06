@@ -97,8 +97,13 @@ def main():
         raise ValueError("Unknown model structure")
 
     for decoder in layers:
-        fully_shard(decoder, **fsdp_config).set_custom_all_gather(QuantizedAllGather())
-    fully_shard(model, **fsdp_config).set_custom_all_gather(QuantizedAllGather())
+        fsdp_module = fully_shard(decoder, **fsdp_config)
+        state = fsdp_module._get_fsdp_state()
+        state._fsdp_param_group.set_custom_all_gather(QuantizedAllGather())
+
+    fsdp_model = fully_shard(model, **fsdp_config)
+    state = fsdp_model._get_fsdp_state()
+    state._fsdp_param_group.set_custom_all_gather(QuantizedAllGather())
 
     model.to_empty(device="cpu" if args.cpu_offload else device)
     model.apply(
