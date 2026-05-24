@@ -98,12 +98,12 @@ def main():
 
     for decoder in layers:
         fsdp_module = fully_shard(decoder, **fsdp_config)
-        state = fsdp_module._get_fsdp_state()
-        state._fsdp_param_group.set_custom_all_gather(QuantizedAllGather())
+        if(args.quantize):
+            fsdp_module.set_custom_all_gather(QuantizedAllGather())
 
     fsdp_model = fully_shard(model, **fsdp_config)
-    state = fsdp_model._get_fsdp_state()
-    state._fsdp_param_group.set_custom_all_gather(QuantizedAllGather())
+    if(args.quantize):
+        fsdp_model.set_custom_all_gather(QuantizedAllGather())
 
     model.to_empty(device="cpu" if args.cpu_offload else device)
     model.apply(
@@ -242,9 +242,6 @@ def main():
                 state["epoch_step"] += 1
                 state["running_loss"] += outputs.loss.item()
                 progress_bar.update(1)
-
-                if state["global_step"] > 10:
-                    return
 
                 if state["global_step"] % args.log_freq == 0:
                     tok_per_step = world_size * args.batch_size * args.seq_length
@@ -417,6 +414,7 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("-s", "--seq-length", default=1024, type=int)
     parser.add_argument("--cpu-offload", default=False, action="store_true")
     parser.add_argument("-p", "--profiler", default=False, action="store_true")
+    parser.add_argument("-q", "--quantize", default=False, action="store_true")
     return parser
 
 
