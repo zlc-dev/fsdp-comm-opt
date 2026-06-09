@@ -50,11 +50,9 @@ class QuantizedAllGather:
             device=input_tensor.device,
         )
 
-        combined_output_list = list(combined_output.unbind(0))
-
         # 3. launch single async all_gather for both scale and data
-        work_combined = dist.all_gather(
-            combined_output_list,
+        work_combined = dist.all_gather_into_tensor(
+            combined_output,
             combined_input,
             group=group,
             async_op=True,
