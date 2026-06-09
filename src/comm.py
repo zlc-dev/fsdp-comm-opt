@@ -32,7 +32,7 @@ class QuantizedAllGather:
         ).to(torch.int8)
 
         # 2. prepare gather buffers - merge scale and data into single byte tensor
-        scale_bytes = scale.to(torch.float32).view(torch.uint8)
+        scale_bytes = scale.to(torch.float32).reshape(1).view(torch.uint8)
         q_input_bytes = q_input.view(torch.uint8).view(-1)
 
         combined_size = scale_bytes.numel() + q_input_bytes.numel()
