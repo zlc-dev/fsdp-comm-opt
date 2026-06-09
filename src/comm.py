@@ -31,55 +31,54 @@ class QuantizedAllGather:
             127,
         ).to(torch.int8)
 
-        # 2. prepare gather buffers
-        flat_numel = q_input.numel()
+        # 2. prepare gather buffers - merge scale and data into single byte tensor
+        scale_bytes = scale.to(torch.float32).view(torch.uint8)
+        q_input_bytes = q_input.view(torch.uint8).view(-1)
 
-        q_output = torch.empty(
-            (world_size, flat_numel),
-            dtype=torch.int8,
+        combined_size = scale_bytes.numel() + q_input_bytes.numel()
+        combined_input = torch.empty(
+            combined_size,
+            dtype=torch.uint8,
+            device=input_tensor.device,
+        )
+        combined_input[:scale_bytes.numel()].copy_(scale_bytes)
+        combined_input[scale_bytes.numel():].copy_(q_input_bytes)
+
+        combined_output = torch.empty(
+            (world_size, combined_size),
+            dtype=torch.uint8,
             device=input_tensor.device,
         )
 
-        q_output_list = list(q_output.unbind(0))
+        combined_output_list = list(combined_output.unbind(0))
 
-        # scale tensor
-        scale_tensor = scale.reshape(1)
-
-        scale_output = torch.empty(
-            (world_size, 1),
-            dtype=scale_tensor.dtype,
-            device=input_tensor.device,
-        )
-
-        scale_output_list = list(scale_output.unbind(0))
-
-        # 3. launch async all_gather
-        work_q = dist.all_gather(
-            q_output_list,
-            q_input.view(-1),
+        # 3. launch single async all_gather for both scale and data
+        work_combined = dist.all_gather(
+            combined_output_list,
+            combined_input,
             group=group,
             async_op=True,
         )
-
-        work_s = dist.all_gather(
-            scale_output_list,
-            scale_tensor,
-            group=group,
-            async_op=True,
-        )
+        assert isinstance(work_combined, dist.Work)
 
         # 4. dequant
         def _dequant():
+            # Separate scale bytes and quantized data from combined output
+            scale_nbytes = scale_bytes.numel()
+            scale_bytes_output = combined_output[:, :scale_nbytes].contiguous()
+            q_output_flat = combined_output[:, scale_nbytes:]
 
-            q = q_output.view(
+            # Reconstruct scale by reinterpreting the gathered bytes as float32
+            scales = scale_bytes_output.view(torch.float32).view(
+                world_size,
+                *([1] * input_tensor.dim()),
+            )
+
+            # Reshape quantized data back to original shape
+            q = q_output_flat.view(torch.int8).view(
                 world_size,
                 *input_tensor.shape
             ).float()
-
-            scales = scale_output.view(
-                world_size,
-                *([1] * input_tensor.dim())
-            )
 
             dequant = q * scales
 
@@ -89,8 +88,7 @@ class QuantizedAllGather:
 
         # 5. sync path
         if not async_op:
-            work_q.wait()
-            work_s.wait()
+            work_combined.wait()
 
             _dequant()
 
@@ -98,6 +96,6 @@ class QuantizedAllGather:
 
         # 6. async path
         return AggregatedWork(
-            [work_q, work_s],
+            [work_combined],
             postprocess_fn=_dequant,
         )
