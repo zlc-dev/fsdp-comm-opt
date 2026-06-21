@@ -14,6 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch import distributed as dist
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.fsdp import fully_shard, CPUOffloadPolicy, MixedPrecisionPolicy
+from torch.profiler import ProfilerActivity
 from torch.distributed.checkpoint.state_dict import (
     get_state_dict,
     set_state_dict,
@@ -189,17 +190,25 @@ def main():
 
     timers = {k: LocalTimer(device) for k in ["data", "forward", "backward", "update"]}
 
-    enable_profiler = (rank == 0 and args.profiler)
+    enable_profiler = args.profiler
     with torch.profiler.profile(
         activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
+            ProfilerActivity.CPU,
+            ProfilerActivity.CUDA,
         ],
-        schedule=torch.profiler.schedule(wait=5, warmup=2, active=3, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(str(exp_dir / "log")),
-        record_shapes=True,
-        with_stack=True,
-        profile_memory=True
+        schedule=torch.profiler.schedule(
+            wait=args.profiler_wait,
+            warmup=args.profiler_warmup,
+            active=args.profiler_active,
+            repeat=1,
+        ),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(
+            str(exp_dir / "log" / f"rank-{rank}")
+        ),
+        record_shapes=False,
+        with_stack=False,
+        profile_memory=False,
+        with_modules=False,
     ) if enable_profiler else contextlib.nullcontext() as prof:
         for state["epoch"] in range(state["epoch"], args.num_epochs):
             LOGGER.info(f"Begin epoch {state['epoch']} at step {state['epoch_step']}")
@@ -223,14 +232,14 @@ def main():
                     # NOTE: for resuming
                     continue
 
-                with timers["forward"], torch.profiler.record_function("FSDP_Forward"):
+                with timers["forward"], torch.profiler.record_function("STEP::forward"):
                     outputs = model(**batch)
                     del batch
 
-                with timers["backward"], torch.profiler.record_function("FSDP_Backward"):
+                with timers["backward"], torch.profiler.record_function("STEP::backward"):
                     outputs.loss.backward()
 
-                with timers["update"], torch.profiler.record_function("FSDP_Update"):
+                with timers["update"], torch.profiler.record_function("STEP::update"):
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=not args.cpu_offload)
@@ -414,6 +423,9 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("-s", "--seq-length", default=1024, type=int)
     parser.add_argument("--cpu-offload", default=False, action="store_true")
     parser.add_argument("-p", "--profiler", default=False, action="store_true")
+    parser.add_argument("--profiler-wait", default=2, type=int)
+    parser.add_argument("--profiler-warmup", default=1, type=int)
+    parser.add_argument("--profiler-active", default=2, type=int)
     parser.add_argument("-q", "--quantize", default=False, action="store_true")
     return parser
 
