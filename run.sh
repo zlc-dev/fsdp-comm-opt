@@ -1,1 +1,1 @@
-TORCHELASTIC_ERROR_FILE=./error.json OMP_NUM_THREADS=1 HF_HOME=./.cache HF_ENDPOINT=https://hf-mirror.com torchrun --nproc-per-node gpu --log-dir ./logs ./src/train.py -d tatsu-lab/alpaca -m openai-community/gpt2-large -e exp_gpt2_large -b 2 -s 1024 --cpu-offload --quantize --profiler
+TORCHELASTIC_ERROR_FILE=./error.json OMP_NUM_THREADS=1 HF_HOME=./.cache HF_ENDPOINT=https://hf-mirror.com torchrun --nproc-per-node gpu --log-dir ./logs ./src/train.py -d tatsu-lab/alpaca -m openai-community/gpt2-xl -e exp_gpt2_xl -b 2 -s 1024 --cpu-offload --profiler -q

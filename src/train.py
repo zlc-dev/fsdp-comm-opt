@@ -97,10 +97,20 @@ def main():
     else:
         raise ValueError("Unknown model structure")
 
+    fsdp_layers = []
     for decoder in layers:
         fsdp_module = fully_shard(decoder, **fsdp_config)
+        fsdp_layers.append(fsdp_module)
         if(args.quantize):
             fsdp_module.set_custom_all_gather(QuantizedAllGather())
+
+    if args.forward_prefetch_distance > 0:
+        for i, fsdp_module in enumerate(fsdp_layers):
+            prefetch_modules = fsdp_layers[
+                i + 1 : i + 1 + args.forward_prefetch_distance
+            ]
+            if prefetch_modules:
+                fsdp_module.set_modules_to_forward_prefetch(prefetch_modules)
 
     fsdp_model = fully_shard(model, **fsdp_config)
     if(args.quantize):
@@ -426,6 +436,7 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profiler-wait", default=2, type=int)
     parser.add_argument("--profiler-warmup", default=1, type=int)
     parser.add_argument("--profiler-active", default=2, type=int)
+    parser.add_argument("--forward-prefetch-distance", default=1, type=int)
     parser.add_argument("-q", "--quantize", default=False, action="store_true")
     return parser
 
