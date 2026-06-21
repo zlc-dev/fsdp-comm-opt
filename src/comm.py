@@ -36,71 +36,67 @@ class QuantizedAllGather:
             )
 
         # 1. quantize
-        with record_function("QAG::quantize"):
-            max_val = input_tensor.abs().max()
+        max_val = input_tensor.abs().max()
 
-            scale = torch.clamp(max_val / 127.0, min=1e-8)
+        scale = torch.clamp(max_val / 127.0, min=1e-8)
 
-            q_input = torch.clamp(
-                (input_tensor / scale).round(),
-                -127,
-                127,
-            ).to(torch.int8)
+        q_input = torch.clamp(
+            (input_tensor / scale).round(),
+            -127,
+            127,
+        ).to(torch.int8)
 
         # 2. prepare gather buffers - merge scale and data into single byte tensor
-        with record_function("QAG::pack"):
-            scale_bytes = scale.to(torch.float32).reshape(1).view(torch.uint8)
-            q_input_bytes = q_input.view(torch.uint8).view(-1)
+        scale_bytes = scale.to(torch.float32).reshape(1).view(torch.uint8)
+        q_input_bytes = q_input.view(torch.uint8).view(-1)
 
-            combined_size = scale_bytes.numel() + q_input_bytes.numel()
-            combined_input = torch.empty(
-                combined_size,
-                dtype=torch.uint8,
-                device=input_tensor.device,
-            )
-            combined_input[:scale_bytes.numel()].copy_(scale_bytes)
-            combined_input[scale_bytes.numel():].copy_(q_input_bytes)
+        combined_size = scale_bytes.numel() + q_input_bytes.numel()
+        combined_input = torch.empty(
+            combined_size,
+            dtype=torch.uint8,
+            device=input_tensor.device,
+        )
+        combined_input[:scale_bytes.numel()].copy_(scale_bytes)
+        combined_input[scale_bytes.numel():].copy_(q_input_bytes)
 
-            combined_output = torch.empty(
-                (world_size, combined_size),
-                dtype=torch.uint8,
-                device=input_tensor.device,
-            )
+        combined_output = torch.empty(
+            (world_size, combined_size),
+            dtype=torch.uint8,
+            device=input_tensor.device,
+        )
 
         # 3. launch single all_gather for both scale and data
-        with record_function("QAG::all_gather_int8"):
-            work_combined = dist.all_gather_into_tensor(
-                combined_output,
-                combined_input,
-                group=group,
-                async_op=async_op,
-            )
+        work_combined = dist.all_gather_into_tensor(
+            combined_output,
+            combined_input,
+            group=group,
+            async_op=async_op,
+        )
 
         # 4. dequant
         def _dequant():
-            with record_function("QAG::dequant"):
-                # Separate scale bytes and quantized data from combined output
-                scale_nbytes = scale_bytes.numel()
-                scale_bytes_output = combined_output[:, :scale_nbytes].contiguous()
-                q_output_flat = combined_output[:, scale_nbytes:]
+            # Separate scale bytes and quantized data from combined output
+            scale_nbytes = scale_bytes.numel()
+            scale_bytes_output = combined_output[:, :scale_nbytes].contiguous()
+            q_output_flat = combined_output[:, scale_nbytes:]
 
-                # Reconstruct scale by reinterpreting the gathered bytes as float32
-                scales = scale_bytes_output.view(torch.float32).view(
-                    world_size,
-                    *([1] * input_tensor.dim()),
-                )
+            # Reconstruct scale by reinterpreting the gathered bytes as float32
+            scales = scale_bytes_output.view(torch.float32).view(
+                world_size,
+                *([1] * input_tensor.dim()),
+            )
 
-                # Reshape quantized data back to original shape
-                q = q_output_flat.view(torch.int8).view(
-                    world_size,
-                    *input_tensor.shape
-                ).to(output_tensor.dtype)
+            # Reshape quantized data back to original shape
+            q = q_output_flat.view(torch.int8).view(
+                world_size,
+                *input_tensor.shape
+            ).to(output_tensor.dtype)
 
-                dequant = q * scales
+            dequant = q * scales
 
-                output_tensor.copy_(
-                    dequant.reshape_as(output_tensor)
-                )
+            output_tensor.copy_(
+                dequant.reshape_as(output_tensor)
+            )
 
         # 5. sync path
         if not async_op:
