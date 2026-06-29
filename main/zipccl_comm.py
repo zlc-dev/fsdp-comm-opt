@@ -1,9 +1,9 @@
 import torch
 import torch.distributed as dist
 
-from work import AggregatedWork
+from .work import AggregatedWork
 
-from ..zipccl import hopper_fastzip2 as _zipccl
+from zipccl import hopper_fastzip2 as _zipccl
 
 class ZipCCLAllGather:
     """AllGather with ZipCCL lossless BF16 compression (split-store approach).

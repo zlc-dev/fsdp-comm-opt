@@ -34,8 +34,8 @@ from transformers import (
 # fixes for reset_parameters not existing
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
-from comm import QuantizedAllGather
-from zipccl_comm import ZipCCLAllGather
+from main.comm import QuantizedAllGather
+from main.zipccl_comm import ZipCCLAllGather
 
 
 def reset_rope(self: LlamaRotaryEmbedding):

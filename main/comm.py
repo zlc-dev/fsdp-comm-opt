@@ -1,7 +1,7 @@
 import torch
 import torch.distributed as dist
 
-from work import AggregatedWork
+from .work import AggregatedWork
 
 class QuantizedAllGather:
 
