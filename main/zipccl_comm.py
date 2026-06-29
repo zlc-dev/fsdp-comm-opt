@@ -25,6 +25,9 @@ class ZipCCLAllGather:
     def __init__(self):
         self._zipccl = _zipccl
 
+    def allocate(self, size, *, dtype, device):
+        return torch.empty(size, dtype=dtype, device=device)
+
     @staticmethod
     def _pad_to_multiple(n: int, m: int) -> int:
         return ((n + m - 1) // m) * m
