@@ -1,13 +1,11 @@
 import torch
 import torch.distributed as dist
-from torch.profiler import record_function
 
 from work import AggregatedWork
 
-
 class QuantizedAllGather:
 
-    def __init__(self, min_quantize_numel = 0):
+    def __init__(self, min_quantize_numel=0):
         self.min_quantize_numel = min_quantize_numel
 
     def allocate(self, size, *, dtype, device):
@@ -100,10 +98,6 @@ class QuantizedAllGather:
 
         # 5. sync path
         if not async_op:
-            # FSDP calls custom all-gather with async_op=False for its normal
-            # overlapped path. Do not wait here: enqueue dequant on FSDP's
-            # all-gather stream so FSDP's event recorded after this call covers
-            # both communication and dequantization.
             _dequant()
 
             stream = torch.cuda.current_stream(input_tensor.device)

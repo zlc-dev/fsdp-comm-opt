@@ -167,3 +167,6 @@ outputs
 logs
 error.json
 logs
+
+# clangd
+.clangd
