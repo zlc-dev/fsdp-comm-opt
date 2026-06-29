@@ -34,6 +34,7 @@ def install():
 
     nvcc_flags = [
         "-arch=sm_90a",
+        "-gencode", "arch=compute_90,code=compute_90", # support RTX 5090
         "-std=c++17",
         "--expt-relaxed-constexpr",
         "-O3",
