@@ -85,20 +85,19 @@ class ZipCCLAllGather:
         )
 
         # ---- 3. all-gather outlier counts (small: world_size ints) ----
-        all_gc_cpu = torch.empty(world_size, dtype=torch.int32)
-        gc_cpu = gc.cpu()
+        all_gc = torch.empty(world_size, dtype=torch.int32, device=device)
         gc_work = dist.all_gather_into_tensor(
-            all_gc_cpu, gc_cpu, group=group, async_op=async_op,
+            all_gc, gc, group=group, async_op=async_op,
         )
 
         # ---- 4/5. post-gather: exchange outliers + decompress ----
         def _finish():
             # Determine max aligned outlier size across ranks
-            max_gc = all_gc_cpu.max().item()
+            max_gc = all_gc.max().item()
             max_gc_aligned = self._align128(max_gc)
 
             # Pad local outliers to max and all-gather
-            local_gc = all_gc_cpu[rank].item()
+            local_gc = all_gc[rank].item()
             if max_gc_aligned > 0:
                 zero_padded = torch.zeros(max_gc_aligned, dtype=torch.uint8, device=device)
                 if local_gc > 0:
@@ -115,7 +114,7 @@ class ZipCCLAllGather:
             zero_flat = gathered_zero.reshape(-1)
 
             n_8_all = torch.full((world_size,), padded_numel, dtype=torch.int32, device=device)
-            nbytes_8_all = all_gc_cpu.to(device)
+            nbytes_8_all = all_gc
 
             out_flat = output_tensor.view(-1)
             if out_flat.dtype != torch.bfloat16:
