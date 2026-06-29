@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch import distributed as dist
 from torch.distributed.elastic.multiprocessing.errors import record
-from torch.distributed.fsdp import fully_shard, CPUOffloadPolicy, MixedPrecisionPolicy
+from torch.distributed.fsdp import FSDPModule, fully_shard, CPUOffloadPolicy, MixedPrecisionPolicy
 from torch.profiler import ProfilerActivity
 from torch.distributed.checkpoint.state_dict import (
     get_state_dict,
@@ -35,6 +35,7 @@ from transformers import (
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
 from comm import QuantizedAllGather
+from zipccl_comm import ZipCCLAllGather
 
 
 def reset_rope(self: LlamaRotaryEmbedding):
@@ -50,6 +51,11 @@ LlamaRotaryEmbedding.reset_parameters = reset_rope
 
 LOGGER = logging.getLogger(__name__)
 
+def set_custom_all_gather(m: FSDPModule, args: argparse.Namespace):
+    if args.zip_ccl:
+        m.set_custom_all_gather(ZipCCLAllGather())
+    else:
+        m.set_custom_all_gather(QuantizedAllGather())
 
 @record
 def main():
@@ -102,7 +108,7 @@ def main():
         fsdp_module = fully_shard(decoder, **fsdp_config)
         fsdp_layers.append(fsdp_module)
         if(args.quantize):
-            fsdp_module.set_custom_all_gather(QuantizedAllGather())
+            set_custom_all_gather(fsdp_module, args)
 
     if args.forward_prefetch_distance > 0:
         for i, fsdp_module in enumerate(fsdp_layers):
@@ -114,7 +120,7 @@ def main():
 
     fsdp_model = fully_shard(model, **fsdp_config)
     if(args.quantize):
-        fsdp_model.set_custom_all_gather(QuantizedAllGather())
+        set_custom_all_gather(fsdp_model, args)
 
     model.to_empty(device="cpu" if args.cpu_offload else device)
     model.apply(
@@ -438,6 +444,7 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profiler-active", default=2, type=int)
     parser.add_argument("--forward-prefetch-distance", default=1, type=int)
     parser.add_argument("-q", "--quantize", default=False, action="store_true")
+    parser.add_argument("--zip-ccl", default=False, action="store_true")
     return parser
 
 
