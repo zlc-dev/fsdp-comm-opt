@@ -170,3 +170,5 @@ logs
 
 # clangd
 .clangd
+
+report/
