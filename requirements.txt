@@ -1,0 +1,6 @@
+torch==2.12+cu130
+torchvision==0.27+cu130
+torch-tb-profiler==0.4
+tqdm==4.68
+datasets==5.0
+transformers==5.12
