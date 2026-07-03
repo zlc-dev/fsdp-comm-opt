@@ -62,9 +62,9 @@ class ZipCCLAllGather:
         n_8_local = torch.tensor([padded_numel], dtype=torch.int32, device=device)
         orig_n_8_local = torch.tensor([orig_numel], dtype=torch.int32, device=device)
 
-        std = input_flat.float().std()
+        std = input_flat.float().std(unbiased=False)
         best_i = torch.round(torch.log2(torch.clamp(std, min=1e-30)) + 121.65)
-        bases_in = torch.tensor([best_i], dtype=torch.int32, device=device)
+        bases_in = torch.clamp(best_i, 0, 249).to(torch.int32).reshape(1)
         
         zero_count_local = torch.zeros(1, dtype=torch.int32, device=device)
 
