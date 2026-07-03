@@ -1,6 +1,8 @@
 import torch
 import torch.distributed as dist
 
+from .stat import Stat
+
 from .work import AggregatedWork
 
 from zipccl import hopper_fastzip2
@@ -12,11 +14,13 @@ _ELEMS_PER_BLOCK = 128 * 32
 def _align(value: int, alignment: int = 128) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
+stats = []
 
 class ZipCCLAllGather:
 
     def __init__(self, min_compress_numel: int = 0):
         self.min_compress_numel = min_compress_numel
+        self.times = 0
 
     def allocate(self, size, *, dtype, device):
         return torch.empty(size, dtype=dtype, device=device)
@@ -44,8 +48,18 @@ class ZipCCLAllGather:
                 group=group,
                 async_op=async_op,
             )
+            
 
         input_flat = input_tensor.contiguous().view(-1)
+
+        if self.times < 10:
+            mi = input_flat.min().item()
+            ma = input_flat.max().item()
+            stat = Stat(mi, ma, 100)
+            stat.add(input_flat)
+            stats.append(stat)
+        self.times += 1
+
         output_flat = output_tensor.view(-1)
 
         orig_numel = input_flat.numel()
@@ -95,15 +109,17 @@ class ZipCCLAllGather:
         zero_counts = torch.empty(world_size, dtype=torch.int32, device=device)
 
         # Launch deterministic stream and outlier-count exchange immediately.
-        det_work = dist.all_gather_into_tensor(
-            det_recv,
-            det_send,
-            group=group,
-            async_op=True,
-        )
+        
         count_work = dist.all_gather_into_tensor(
             zero_counts,
             zero_count_local,
+            group=group,
+            async_op=True,
+        )
+
+        det_work = dist.all_gather_into_tensor(
+            det_recv,
+            det_send,
             group=group,
             async_op=True,
         )

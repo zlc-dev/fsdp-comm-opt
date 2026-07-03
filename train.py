@@ -35,7 +35,7 @@ from transformers import (
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
 from main.comm import QuantizedAllGather
-from main.zipccl_comm import ZipCCLAllGather
+from main.zipccl_comm import ZipCCLAllGather, stats
 
 
 def reset_rope(self: LlamaRotaryEmbedding):
@@ -207,6 +207,7 @@ def main():
     timers = {k: LocalTimer(device) for k in ["data", "forward", "backward", "update"]}
 
     enable_profiler = args.profiler
+    stats_dumped = False
     with torch.profiler.profile(
         activities=[
             ProfilerActivity.CPU,
@@ -226,6 +227,7 @@ def main():
         profile_memory=False,
         with_modules=False,
     ) if enable_profiler else contextlib.nullcontext() as prof:
+        
         for state["epoch"] in range(state["epoch"], args.num_epochs):
             LOGGER.info(f"Begin epoch {state['epoch']} at step {state['epoch_step']}")
 
@@ -267,6 +269,15 @@ def main():
                 state["epoch_step"] += 1
                 state["running_loss"] += outputs.loss.item()
                 progress_bar.update(1)
+
+                if state["global_step"] > 20 and not stats_dumped:
+                    stats_dir = exp_dir / "log" / f"rank-{rank}" / "stats"
+                    stats_dir.mkdir(parents=True, exist_ok=True)
+                    for idx, stat in enumerate(stats[:10]):
+                        with open(stats_dir / f"all_gather_{idx}.csv", "w") as fp:
+                            fp.write(stat.to_csv())
+                    stats_dumped = True
+                    LOGGER.info(f"Wrote {min(len(stats), 10)} ZipCCL stats CSV files to {stats_dir}")
 
                 if state["global_step"] % args.log_freq == 0:
                     tok_per_step = world_size * args.batch_size * args.seq_length
