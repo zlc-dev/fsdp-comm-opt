@@ -34,8 +34,7 @@ from transformers import (
 # fixes for reset_parameters not existing
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
-from main.comm import QuantizedAllGather
-from main.zipccl_comm import ZipCCLAllGather, stats
+from main.zipccl_comm import ZipCCLAllGather
 
 
 def reset_rope(self: LlamaRotaryEmbedding):
@@ -52,10 +51,8 @@ LlamaRotaryEmbedding.reset_parameters = reset_rope
 LOGGER = logging.getLogger(__name__)
 
 def set_custom_all_gather(m: FSDPModule, args: argparse.Namespace):
-    if args.zip_ccl:
-        m.set_custom_all_gather(ZipCCLAllGather())
-    else:
-        m.set_custom_all_gather(QuantizedAllGather())
+    _ = args
+    m.set_custom_all_gather(ZipCCLAllGather())
 
 @record
 def main():
@@ -270,15 +267,6 @@ def main():
                 state["running_loss"] += outputs.loss.item()
                 progress_bar.update(1)
 
-                if state["global_step"] > 20 and not stats_dumped:
-                    stats_dir = exp_dir / "log" / f"rank-{rank}" / "stats"
-                    stats_dir.mkdir(parents=True, exist_ok=True)
-                    for idx, stat in enumerate(stats[:10]):
-                        with open(stats_dir / f"all_gather_{idx}.csv", "w") as fp:
-                            fp.write(stat.to_csv())
-                    stats_dumped = True
-                    LOGGER.info(f"Wrote {min(len(stats), 10)} ZipCCL stats CSV files to {stats_dir}")
-
                 if state["global_step"] % args.log_freq == 0:
                     tok_per_step = world_size * args.batch_size * args.seq_length
                     ms_per_step = sum(t.avg_elapsed_ms() for t in timers.values())
@@ -455,7 +443,6 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profiler-active", default=2, type=int)
     parser.add_argument("--forward-prefetch-distance", default=1, type=int)
     parser.add_argument("-q", "--quantize", default=False, action="store_true")
-    parser.add_argument("--zip-ccl", default=False, action="store_true")
     return parser
 
 

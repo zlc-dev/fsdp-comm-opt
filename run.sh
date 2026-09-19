@@ -1,1 +1,9 @@
-TORCHELASTIC_ERROR_FILE=./error.json OMP_NUM_THREADS=1 HF_HOME=./.cache HF_ENDPOINT=https://hf-mirror.com torchrun --nproc-per-node gpu --log-dir ./logs train.py -d tatsu-lab/alpaca -m openai-community/gpt2-xl -e exp_gpt2_xl -b 2 -s 1024 --profiler -q --zip-ccl
+TORCHELASTIC_ERROR_FILE=./error.json \
+OMP_NUM_THREADS=1 \
+HF_ENDPOINT=https://hf-mirror.com \
+torchrun --nproc-per-node gpu --log-dir ./logs train.py \
+    --model-name meta-llama/Meta-Llama-3-8B \
+    --dataset-name tatsu-lab/alpaca \
+    --experiment-name exp_llama3_8b_zipccl \
+    --profiler \
+    --quantize

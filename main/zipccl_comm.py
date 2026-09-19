@@ -1,26 +1,17 @@
 import torch
 import torch.distributed as dist
 
-from .stat import Stat
-
-from .work import AggregatedWork
-
 from zipccl import hopper_fastzip2
-
 
 _ELEMS_PER_BLOCK = 128 * 32
 
-
 def _align(value: int, alignment: int = 128) -> int:
     return ((value + alignment - 1) // alignment) * alignment
-
-stats = []
 
 class ZipCCLAllGather:
 
     def __init__(self, min_compress_numel: int = 0):
         self.min_compress_numel = min_compress_numel
-        self.times = 0
 
     def allocate(self, size, *, dtype, device):
         return torch.empty(size, dtype=dtype, device=device)
@@ -36,6 +27,7 @@ class ZipCCLAllGather:
 
         if (
             world_size == 1
+            or async_op
             or input_tensor.numel() < self.min_compress_numel
             or input_tensor.dtype != torch.bfloat16
             or output_tensor.dtype != torch.bfloat16
@@ -48,18 +40,8 @@ class ZipCCLAllGather:
                 group=group,
                 async_op=async_op,
             )
-            
 
         input_flat = input_tensor.contiguous().view(-1)
-
-        if self.times < 10:
-            mi = input_flat.min().item()
-            ma = input_flat.max().item()
-            stat = Stat(mi, ma, 100)
-            stat.add(input_flat)
-            stats.append(stat)
-        self.times += 1
-
         output_flat = output_tensor.view(-1)
 
         orig_numel = input_flat.numel()
@@ -109,7 +91,7 @@ class ZipCCLAllGather:
         zero_counts = torch.empty(world_size, dtype=torch.int32, device=device)
 
         # Launch deterministic stream and outlier-count exchange immediately.
-        
+
         count_work = dist.all_gather_into_tensor(
             zero_counts,
             zero_count_local,
@@ -199,12 +181,11 @@ class ZipCCLAllGather:
             ):
                 tensor.record_stream(stream)
 
-        works = [det_work, zero_work]
-        if not async_op:
-            for work in works:
-                work.wait()
-            _decompress()
-            return None
+        det_work.wait()
+        zero_work.wait()
 
-        return AggregatedWork(works, postprocess_fn=_decompress)
+        _decompress()
+
+        return None
+
 
