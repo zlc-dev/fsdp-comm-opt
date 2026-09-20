@@ -36,12 +36,24 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEm
 
 from main.zipccl_comm import ZipCCLAllGather
 
-
 def reset_rope(self: LlamaRotaryEmbedding):
-    self.inv_freq, self.attention_scaling = self.rope_init_fn(
-        self.config, self.inv_freq.device
-    )
-    self.original_inv_freq = self.inv_freq
+    rope_init_fn = getattr(self, "rope_init_fn", None)
+    if rope_init_fn is None:
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+        rope_type = getattr(self, "rope_type", "default")
+        if rope_type == "default":
+            rope_init_fn = self.compute_default_rope_parameters
+        else:
+            try:
+                rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+            except KeyError as exc:
+                raise ValueError(f"Unsupported RoPE type: {rope_type!r}") from exc
+
+    device = self.inv_freq.device
+    self.inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+    # Keep the original frequencies independent of later dynamic-RoPE updates.
+    self.original_inv_freq = self.inv_freq.clone()
 
 
 LlamaRMSNorm.reset_parameters = lambda self: torch.nn.init.ones_(self.weight)
@@ -53,6 +65,40 @@ LOGGER = logging.getLogger(__name__)
 def set_custom_all_gather(m: FSDPModule, args: argparse.Namespace):
     _ = args
     m.set_custom_all_gather(ZipCCLAllGather())
+
+
+def _create_warmup_cosine_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_steps: int,
+    warmup_ratio: float,
+    min_lr_ratio: float,
+) -> tuple[torch.optim.lr_scheduler.LambdaLR, int]:
+    """Create a finite, non-restarting warmup + cosine LR schedule."""
+    if total_steps <= 0:
+        raise ValueError("total training steps must be positive")
+    if not 0.0 <= warmup_ratio < 1.0:
+        raise ValueError("--warmup-ratio must be in [0, 1)")
+    if not 0.0 <= min_lr_ratio <= 1.0:
+        raise ValueError("--min-lr-ratio must be in [0, 1]")
+
+    warmup_steps = int(total_steps * warmup_ratio)
+    decay_steps = total_steps - warmup_steps
+
+    def lr_factor(current_step: int) -> float:
+        # Start with a useful non-zero LR while still ramping conservatively.
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return float(current_step + 1) / float(warmup_steps)
+
+        if decay_steps <= 1:
+            return 1.0
+        progress = (current_step - warmup_steps) / float(decay_steps - 1)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor), warmup_steps
+
+
 
 @record
 def main():
@@ -140,9 +186,26 @@ def main():
     )
     LOGGER.debug(f"{len(dataloader)} batches per epoch")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=1000, eta_min=args.lr * 1e-2
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.weight_decay,
+        fused=True,
+    )
+    total_training_steps = args.num_epochs * len(dataloader)
+    lr_scheduler, warmup_steps = _create_warmup_cosine_scheduler(
+        optimizer,
+        total_steps=total_training_steps,
+        warmup_ratio=args.warmup_ratio,
+        min_lr_ratio=args.min_lr_ratio,
+    )
+    LOGGER.info(
+        "LR schedule: %d total steps, %d warmup steps, cosine decay from %.3g to %.3g",
+        total_training_steps,
+        warmup_steps,
+        args.lr,
+        args.lr * args.min_lr_ratio,
     )
 
     is_experiment = False
@@ -449,6 +512,24 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--num-epochs", default=100, type=int)
     parser.add_argument("--lr", default=3e-5, type=float)
+    parser.add_argument(
+        "--warmup-ratio",
+        default=0.03,
+        type=float,
+        help="fraction of total optimizer steps used for linear LR warmup (default: 0.03)",
+    )
+    parser.add_argument(
+        "--min-lr-ratio",
+        default=0.1,
+        type=float,
+        help="final LR as a fraction of --lr after cosine decay (default: 0.1)",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        default=0.1,
+        type=float,
+        help="AdamW weight decay (default: 0.1)",
+    )
     parser.add_argument("-b", "--batch-size", default=1, type=int)
     parser.add_argument("--log-freq", default=10, type=int)
     parser.add_argument("--ckpt-freq", default=500, type=int)

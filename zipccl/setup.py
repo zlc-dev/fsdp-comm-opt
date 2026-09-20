@@ -33,8 +33,7 @@ def install():
     ext_args += ["-DUSE_GPU"]
 
     nvcc_flags = [
-        "-arch=sm_90a",
-        "-gencode", "arch=compute_90,code=compute_90", # support RTX 5090
+        "-arch=sm_120",
         "-std=c++17",
         "--expt-relaxed-constexpr",
         "-O3",
