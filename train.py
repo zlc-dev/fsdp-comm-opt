@@ -530,6 +530,8 @@ def _get_parser() -> argparse.ArgumentParser:
         type=float,
         help="AdamW weight decay (default: 0.1)",
     )
+    parser.add_argument("--adam-beta1", default=0.9, type=float)
+    parser.add_argument("--adam-beta2", default=0.95, type=float)
     parser.add_argument("-b", "--batch-size", default=1, type=int)
     parser.add_argument("--log-freq", default=10, type=int)
     parser.add_argument("--ckpt-freq", default=500, type=int)
