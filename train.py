@@ -204,7 +204,11 @@ def main():
     timers = {k: LocalTimer(device) for k in ["data", "forward", "backward", "update"]}
 
     enable_profiler = args.profiler
-    stats_dumped = False
+    profiler_steps = 0
+    profiler_total_steps = (
+        args.profiler_wait + args.profiler_warmup + args.profiler_active
+    )
+    profiler_finished = False
     with torch.profiler.profile(
         activities=[
             ProfilerActivity.CPU,
@@ -261,6 +265,7 @@ def main():
 
                 if prof is not None:
                     prof.step()
+                    profiler_steps += 1
 
                 state["global_step"] += 1
                 state["epoch_step"] += 1
@@ -293,7 +298,16 @@ def main():
                     for t in timers.values():
                         t.reset()
 
-                if is_experiment and state["global_step"] % args.ckpt_freq == 0:
+                if enable_profiler and profiler_steps >= profiler_total_steps:
+                    LOGGER.info(
+                        "Profiler finished after %d training steps; stopping training",
+                        profiler_steps,
+                    )
+                    profiler_finished = True
+                    progress_bar.close()
+                    break
+
+                if is_experiment and args.ckpt_freq != 0 and state["global_step"] % args.ckpt_freq == 0:
                     dist.barrier()
                     # NOTE: we have to call this on ALL ranks
                     sharded_model_state, sharded_optimizer_state = get_state_dict(
@@ -308,6 +322,9 @@ def main():
                         with open(exp_dir / "state.json", "w") as fp:
                             json.dump(state, fp)
                     dist.barrier()
+
+            if profiler_finished:
+                break
 
             state["epoch_step"] = 0
 
@@ -438,9 +455,9 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("-s", "--seq-length", default=1024, type=int)
     parser.add_argument("--cpu-offload", default=False, action="store_true")
     parser.add_argument("-p", "--profiler", default=False, action="store_true")
-    parser.add_argument("--profiler-wait", default=10, type=int)
+    parser.add_argument("--profiler-wait", default=100, type=int)
     parser.add_argument("--profiler-warmup", default=5, type=int)
-    parser.add_argument("--profiler-active", default=2, type=int)
+    parser.add_argument("--profiler-active", default=3, type=int)
     parser.add_argument("--forward-prefetch-distance", default=1, type=int)
     parser.add_argument("-q", "--quantize", default=False, action="store_true")
     return parser
