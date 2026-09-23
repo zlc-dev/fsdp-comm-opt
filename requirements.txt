@@ -4,3 +4,4 @@ torch-tb-profiler==0.4
 tqdm==4.68
 datasets==5.0
 transformers==5.12
+wandb>=0.21

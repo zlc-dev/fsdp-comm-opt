@@ -61,7 +61,7 @@ class ZZipCCLAllGather:
         # Estimate best_i from the original distribution, then deliberately
         # drop values below the lowest BF16 exponent represented by best_i.
         std = input_flat.std(unbiased=False).float()
-        best_i = torch.round(torch.log2(torch.clamp(std, min=1e-30)) + 121.65)
+        best_i = torch.round(torch.log2(torch.clamp(std, min=1e-30)) + 124.08)
         bases_in = torch.clamp(best_i, 0, 249).to(torch.int32).reshape(1)
         zero_threshold = min(torch.exp2(bases_in.float() - 127), 1e-6)
         compressed_input = torch.where(

@@ -2,6 +2,7 @@ import argparse
 from contextlib import contextmanager
 import contextlib
 import json
+import math
 import multiprocessing
 import os
 import time
@@ -118,6 +119,23 @@ def main():
         format=f"[rank={rank}] [%(asctime)s] %(levelname)s:%(message)s",
         level=logging.INFO,
     )
+
+    wandb_run = None
+    if args.wandb and rank == 0:
+        try:
+            import wandb
+        except ImportError as exc:
+            raise RuntimeError(
+                "W&B logging was requested; install the 'wandb' package first"
+            ) from exc
+
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.experiment_name,
+            mode=args.wandb_mode,
+            config=vars(args),
+        )
 
     LOGGER.debug(os.environ)
     LOGGER.debug(args)
@@ -338,12 +356,17 @@ def main():
                 progress_bar.update(1)
 
                 if state["global_step"] % args.log_freq == 0:
+                    loss_sum = torch.tensor(
+                        state["running_loss"], dtype=torch.float64, device=device
+                    )
+                    dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
                     tok_per_step = world_size * args.batch_size * args.seq_length
                     ms_per_step = sum(t.avg_elapsed_ms() for t in timers.values())
                     info = {
                         "global_step": state["global_step"],
                         "lr": lr_scheduler.get_last_lr()[0],
-                        "running_loss": state["running_loss"] / args.log_freq,
+                        "running_loss": loss_sum.item()
+                        / (args.log_freq * world_size),
                         "epoch": state["epoch"],
                         "epoch_progress": state["epoch_step"] / len(dataloader),
                         "num_batches_remaining": len(dataloader) - i_step,
@@ -357,6 +380,32 @@ def main():
                     }
 
                     LOGGER.info(info)
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                "train/loss": info["running_loss"],
+                                "train/learning_rate": info["lr"],
+                                "train/epoch": info["epoch"],
+                                "train/epoch_progress": info["epoch_progress"],
+                                "train/tokens_per_s": info["tokens_per_s"],
+                                "train/step_time_ms": info["time/total"],
+                                **{
+                                    f"time/{key}_ms": info[f"time/{key}"]
+                                    for key in timers
+                                },
+                                **{
+                                    f"memory/{key}": info[key]
+                                    for key in (
+                                        "total_gb",
+                                        "curr_alloc_gb",
+                                        "peak_alloc_gb",
+                                        "curr_resv_gb",
+                                        "peak_resv_gb",
+                                    )
+                                },
+                            },
+                            step=state["global_step"],
+                        )
 
                     torch.cuda.reset_peak_memory_stats(device)
                     state["running_loss"] = 0
@@ -392,6 +441,9 @@ def main():
                 break
 
             state["epoch_step"] = 0
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 def _load_and_preprocess_data(args, config):
@@ -546,6 +598,18 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--forward-prefetch-distance", default=1, type=int)
     parser.add_argument("-q", "--quantize", default=False, action="store_true")
     parser.add_argument("--quantize-name", default=None)
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="log training metrics to Weights & Biases",
+    )
+    parser.add_argument("--wandb-project", default="fsdp-comm-opt")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument(
+        "--wandb-mode",
+        choices=("online", "offline", "disabled"),
+        default="online",
+    )
     return parser
 
 
