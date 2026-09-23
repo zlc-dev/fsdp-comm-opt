@@ -1,3 +1,4 @@
+#include "ATen/core/TensorBody.h"
 #include <torch/extension.h>
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -14,6 +15,7 @@ void zero_compress_split_store_pad_api_8(
     int* zero_count_8,
     int* retained_count_8,
     int* bases_in,
+    int* zero_exp_threshold,
     int padded_n_total,
     int n_works);
 
@@ -96,6 +98,7 @@ void compress_split_store_pad(
     torch::Tensor n_8,
     torch::Tensor orig_n_8,
     torch::Tensor bases_in,
+    torch::Tensor zero_exp_threshold,
     torch::Tensor compressed_output,
     torch::Tensor staging,
     torch::Tensor retained_output,
@@ -109,6 +112,7 @@ void compress_split_store_pad(
     check_tensor(n_8, "n_8", torch::kInt32);
     check_tensor(orig_n_8, "orig_n_8", torch::kInt32);
     check_tensor(bases_in, "bases_in", torch::kInt32);
+    check_tensor(zero_exp_threshold, "zero_exp_threshold", torch::kInt32);
     check_tensor(compressed_output, "compressed_output", torch::kUInt8);
     check_tensor(staging, "staging", torch::kUInt8);
     check_tensor(retained_output, "retained_output", torch::kUInt8);
@@ -122,6 +126,7 @@ void compress_split_store_pad(
     TORCH_CHECK(orig_n_8.numel() >= n_works,
                 "orig_n_8 must contain n_works entries");
     TORCH_CHECK(bases_in.numel() >= 1, "bases_in must not be empty");
+    TORCH_CHECK(zero_exp_threshold.numel() >= 1, "zero_exp_threshold must not be empty");
     TORCH_CHECK(staging.numel() >= 2LL * padded_n_total,
                 "staging must have at least 2 * padded_n_total bytes");
     TORCH_CHECK(retained_output.numel() >= padded_n_total,
@@ -130,6 +135,7 @@ void compress_split_store_pad(
                 "zero_output must have at least padded_n_total bytes");
     check_same_device(orig_n_8, input, "orig_n_8");
     check_same_device(bases_in, input, "bases_in");
+    check_same_device(zero_exp_threshold, input, "zero_exp_threshold");
     check_same_device(compressed_output, input, "compressed_output");
     check_same_device(staging, input, "staging");
     check_same_device(retained_output, input, "retained_output");
@@ -146,6 +152,7 @@ void compress_split_store_pad(
         zero_count_8.data_ptr<int>(),
         retained_count_8.data_ptr<int>(),
         bases_in.data_ptr<int>(),
+        zero_exp_threshold.data_ptr<int>(),
         padded_n_total,
         n_works);
 }

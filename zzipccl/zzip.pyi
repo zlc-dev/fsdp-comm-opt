@@ -8,6 +8,7 @@ def compress_split_store_pad(
     n_8: torch.Tensor,
     orig_n_8: torch.Tensor,
     bases_in: torch.Tensor,
+    zero_exp_threshold: torch.Tensor,
     compressed_output: torch.Tensor,
     staging: torch.Tensor,
     retained_output: torch.Tensor,

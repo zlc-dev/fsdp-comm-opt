@@ -63,12 +63,6 @@ class ZZipCCLAllGather:
         std = input_flat.std(unbiased=False).float()
         best_i = torch.round(torch.log2(torch.clamp(std, min=1e-30)) + 124.08)
         bases_in = torch.clamp(best_i, 0, 249).to(torch.int32).reshape(1)
-        zero_threshold = min(torch.exp2(bases_in.float() - 127), 1e-6)
-        compressed_input = torch.where(
-            input_flat.abs() < zero_threshold,
-            torch.zeros((), dtype=input_flat.dtype, device=device),
-            input_flat,
-        )
 
         retained_count_local = torch.zeros(1, dtype=torch.int32, device=device)
         zero_count_local = torch.zeros(1, dtype=torch.int32, device=device)
@@ -82,11 +76,14 @@ class ZZipCCLAllGather:
             padded_numel, dtype=torch.uint8, device=device
         )
 
+        # 107 is the exponent field for 2**-20, just below the 1e-6 cap.
+        zero_exp_threshold = torch.tensor([107], dtype=torch.int32, device=device)
         zzip.compress_split_store_pad(
-            compressed_input,
+            input_flat,
             n_8_local,
             orig_n_8_local,
             bases_in,
+            zero_exp_threshold,
             det_send,
             staging,
             retained_send_compact,
@@ -196,10 +193,10 @@ class ZZipCCLAllGather:
         stream = torch.cuda.current_stream(device)
         for tensor in (
             input_flat,
-            compressed_input,
             n_8_local,
             orig_n_8_local,
             bases_in,
+            zero_exp_threshold,
             det_send,
             staging,
             retained_send_compact,

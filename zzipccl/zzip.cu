@@ -13,6 +13,8 @@ static constexpr int PACK       = 32;
 static constexpr int WARP_SIZE  = 32;
 static constexpr int ELEMS_PER_BLOCK = BLOCK_SIZE * PACK;  // 4096
 static constexpr int ALIGN_BYTES = 128;
+static constexpr int COPY_BLK = 128;
+static constexpr int COPY_CHUNK = COPY_BLK * 16;
 
 template <typename T> using rptr = T * __restrict__;
 
@@ -37,12 +39,14 @@ __global__ void zero_compress_split_store_pad_kernel(
     rptr<int> global_zero_counter_8,
     rptr<int> global_retained_counter_8,
     rptr<int> bases_in,
+    rptr<int> zero_exp_threshold,
     int n_works)
 {
     const int tid     = threadIdx.x;
     const int lane    = tid % WARP_SIZE;
     const int warp_id = tid / WARP_SIZE;
     const int best_i  = bases_in[0];
+    const int zero_cutoff = zero_exp_threshold[0];
 
     // --- locate which work this block belongs to + dense input offset ---
     // Done ONCE per block by thread 0 into shared memory (with an early break),
@@ -131,7 +135,7 @@ __global__ void zero_compress_split_store_pad_kernel(
         int e = static_cast<int>(exp_local[j]);
         int m = static_cast<int>(sm_local[j] & 0x7F);
         unsigned int code = (e >= best_i && e < best_i + 6) ? (e - best_i + 1) : 0u;
-        code = (code == 0u && e == 0 && m == 0) ? 7 : code;
+        code = (code == 0 && e < zero_cutoff) ? 7 : code;
         b0 |= ((code >> 0) & 1u) << j;
         b1 |= ((code >> 1) & 1u) << j;
         b2 |= ((code >> 2) & 1u) << j;
@@ -236,32 +240,101 @@ __global__ void zero_compact_two_streams_kernel(
     const rptr<int> zero_count_8,
     int n_works)
 {
-    int i = (int)blockIdx.x;
-    if (i >= n_works) return;
+    extern __shared__ __align__(128) uint8_t copy_smem[];
 
-    __shared__ int retained_in, zero_in, retained_out, zero_out;
+    __shared__ int s_i, s_real_n_block, s_nblocks;
+    __shared__ size_t s_staging_off, s_retained_off, s_zero_off;
     if (threadIdx.x == 0) {
-        int in_off = 0, out_r = 0, out_z = 0;
-        for (int j = 0; j < n_works; ++j) {
-            if (j == i) {
-                retained_in = in_off;
-                zero_in = in_off + n_8[j];
-                retained_out = out_r;
-                zero_out = out_z;
+        int block_base = 0;
+        size_t staging_off = 0, retained_off = 0, zero_off = 0;
+        int found = -1;
+        for (int i = 0; i < n_works; ++i) {
+            int n = n_8[i];
+            int blocks = n / ELEMS_PER_BLOCK;
+            if ((int)blockIdx.x >= block_base &&
+                (int)blockIdx.x < block_base + blocks) {
+                found = i;
+                s_real_n_block = (int)blockIdx.x - block_base;
+                s_nblocks = blocks;
+                s_staging_off = staging_off;
+                s_retained_off = retained_off;
+                s_zero_off = zero_off;
+                break;
             }
-            in_off += 2 * n_8[j];
-            out_r += (retained_count_8[j] + ALIGN_BYTES - 1) / ALIGN_BYTES * ALIGN_BYTES;
-            out_z += (zero_count_8[j] + ALIGN_BYTES - 1) / ALIGN_BYTES * ALIGN_BYTES;
+            block_base += blocks;
+            staging_off += 2ULL * n;
+            retained_off +=
+                (retained_count_8[i] + ALIGN_BYTES - 1) / ALIGN_BYTES
+                * ALIGN_BYTES;
+            zero_off +=
+                (zero_count_8[i] + ALIGN_BYTES - 1) / ALIGN_BYTES
+                * ALIGN_BYTES;
         }
+        s_i = found;
     }
     __syncthreads();
+    if (s_i < 0) return;
 
-    int nr = retained_count_8[i];
-    int nz = zero_count_8[i];
-    for (int p = threadIdx.x; p < nr; p += blockDim.x)
-        retained_output[retained_out + p] = staging[retained_in + p];
-    for (int p = threadIdx.x; p < nz; p += blockDim.x)
-        zero_output[zero_out + p] = staging[zero_in + p];
+    int nr = retained_count_8[s_i];
+    int nz = zero_count_8[s_i];
+    int nr_bytes = (nr + ALIGN_BYTES - 1) / ALIGN_BYTES * ALIGN_BYTES;
+    int nz_bytes = (nz + ALIGN_BYTES - 1) / ALIGN_BYTES * ALIGN_BYTES;
+    int tiles = max(
+        (nr_bytes + COPY_CHUNK - 1) / COPY_CHUNK,
+        (nz_bytes + COPY_CHUNK - 1) / COPY_CHUNK);
+    int tiles_per_block = (tiles + s_nblocks - 1) / s_nblocks;
+    int tile_start = s_real_n_block * tiles_per_block;
+    int tile_end = min(tile_start + tiles_per_block, tiles);
+    const unsigned char* retained_in = staging + s_staging_off;
+    const unsigned char* zero_in = retained_in + n_8[s_i];
+
+    for (int tile = tile_start; tile < tile_end; ++tile) {
+        int byte_start = tile * COPY_CHUNK;
+        int retained_size = min(COPY_CHUNK, nr_bytes - byte_start);
+        int zero_size = min(COPY_CHUNK, nz_bytes - byte_start);
+
+        for (int off = threadIdx.x * 16; off < retained_size;
+             off += COPY_BLK * 16) {
+            if (off + 16 <= retained_size)
+                *reinterpret_cast<float4*>(copy_smem + off) =
+                    *reinterpret_cast<const float4*>(retained_in + byte_start + off);
+            else
+                for (int k = off; k < retained_size; ++k)
+                    copy_smem[k] = retained_in[byte_start + k];
+        }
+        __syncthreads();
+        for (int off = threadIdx.x * 16; off < retained_size;
+             off += COPY_BLK * 16) {
+            if (off + 16 <= retained_size)
+                *reinterpret_cast<float4*>(retained_output + s_retained_off + byte_start + off) =
+                    *reinterpret_cast<const float4*>(copy_smem + off);
+            else
+                for (int k = off; k < retained_size; ++k)
+                    retained_output[s_retained_off + byte_start + k] = copy_smem[k];
+        }
+        __syncthreads();
+
+        for (int off = threadIdx.x * 16; off < zero_size;
+             off += COPY_BLK * 16) {
+            if (off + 16 <= zero_size)
+                *reinterpret_cast<float4*>(copy_smem + COPY_CHUNK + off) =
+                    *reinterpret_cast<const float4*>(zero_in + byte_start + off);
+            else
+                for (int k = off; k < zero_size; ++k)
+                    copy_smem[COPY_CHUNK + k] = zero_in[byte_start + k];
+        }
+        __syncthreads();
+        for (int off = threadIdx.x * 16; off < zero_size;
+             off += COPY_BLK * 16) {
+            if (off + 16 <= zero_size)
+                *reinterpret_cast<float4*>(zero_output + s_zero_off + byte_start + off) =
+                    *reinterpret_cast<const float4*>(copy_smem + COPY_CHUNK + off);
+            else
+                for (int k = off; k < zero_size; ++k)
+                    zero_output[s_zero_off + byte_start + k] = copy_smem[COPY_CHUNK + k];
+        }
+        __syncthreads();
+    }
 }
 
 // Decode the zero-dropping format.  `compressed_input` contains only the
@@ -428,7 +501,7 @@ void zero_compress_split_store_pad_api_8(
     unsigned char* staging,
     unsigned char* retained_output, unsigned char* zero_output,
     int* n_8, int* orig_n_8, int* zero_count_8, int* retained_count_8,
-    int* bases_in, int padded_n_total, int n_works)
+    int* bases_in, int* zero_exp_threshold, int padded_n_total, int n_works)
 {
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     int blocks = padded_n_total / ELEMS_PER_BLOCK;
@@ -437,8 +510,10 @@ void zero_compress_split_store_pad_api_8(
     cudaMemsetAsync(retained_count_8, 0, n_works * sizeof(int), stream);
     zero_compress_split_store_pad_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
         input, output, staging, n_8, orig_n_8, zero_count_8,
-        retained_count_8, bases_in, n_works);
-    zero_compact_two_streams_kernel<<<n_works, BLOCK_SIZE, 0, stream>>>(
+        retained_count_8, bases_in, zero_exp_threshold, n_works);
+    int compact_blocks = padded_n_total / ELEMS_PER_BLOCK;
+    zero_compact_two_streams_kernel<<<compact_blocks, COPY_BLK,
+                                      2 * COPY_CHUNK, stream>>>(
         staging, retained_output, zero_output,
         n_8, retained_count_8, zero_count_8, n_works);
 }
