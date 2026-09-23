@@ -50,7 +50,7 @@ def install():
             CUDAExtension(
                 "zzip",
                 sources=[
-                    "zzip.cpp",
+                    "fast_zzip.cpp",
                     "zzip.cu",
                 ],
                 library_dirs=["/usr/local/cuda/lib64/stubs"],
