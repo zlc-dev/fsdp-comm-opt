@@ -7,5 +7,6 @@ torchrun --nproc-per-node gpu --log-dir ./logs train.py \
     --experiment-name exp_llama3_8b_zipccl \
     --wandb \
     --wandb-project fsdp-comm-opt \
+    --wandb-mode online \
     --profiler \
     --quantize
