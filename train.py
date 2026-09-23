@@ -35,6 +35,7 @@ from transformers import (
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
 from main.zipccl_comm import ZipCCLAllGather
+from main.zzipccl_comm import ZZipCCLAllGather
 
 def reset_rope(self: LlamaRotaryEmbedding):
     rope_init_fn = getattr(self, "rope_init_fn", None)
@@ -63,9 +64,10 @@ LlamaRotaryEmbedding.reset_parameters = reset_rope
 LOGGER = logging.getLogger(__name__)
 
 def set_custom_all_gather(m: FSDPModule, args: argparse.Namespace):
-    _ = args
-    m.set_custom_all_gather(ZipCCLAllGather())
-
+    if args.quantize_name == "zzipccl":
+        m.set_custom_all_gather(ZZipCCLAllGather())
+    else:
+        m.set_custom_all_gather(ZipCCLAllGather())
 
 def _create_warmup_cosine_scheduler(
     optimizer: torch.optim.Optimizer,
@@ -543,6 +545,7 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profiler-active", default=3, type=int)
     parser.add_argument("--forward-prefetch-distance", default=1, type=int)
     parser.add_argument("-q", "--quantize", default=False, action="store_true")
+    parser.add_argument("--quantize-name", default=None)
     return parser
 
 
