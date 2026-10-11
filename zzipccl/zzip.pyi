@@ -59,3 +59,37 @@ def decompress_split_store_unpad(
 ) -> None:
     """Decompress into ``n_works`` compact works of ``orig_ele_num`` values."""
     ...
+
+
+def hopper_compress(
+    input: torch.Tensor,
+    n_8: torch.Tensor,
+    orig_n_8: torch.Tensor,
+    bases_in: torch.Tensor,
+    compressed_output: torch.Tensor,
+    staging: torch.Tensor,
+    zero_output: torch.Tensor,
+    zero_count_8: torch.Tensor,
+    padded_n_total: int,
+    n_works: int,
+) -> None:
+    """Run Hopper split-store compression with in-kernel input padding.
+
+    ``zero_count_8`` is reset and then overwritten with each work's outlier
+    count. ``staging`` and ``zero_output`` each need at least
+    ``padded_n_total`` bytes.
+    """
+    ...
+
+
+def hopper_decompress(
+    compressed_input: torch.Tensor,
+    zero_input: torch.Tensor,
+    n_8: torch.Tensor,
+    zero_count_8: torch.Tensor,
+    output: torch.Tensor,
+    orig_ele_num: int,
+    n_works: int,
+) -> None:
+    """Run Hopper split-store decompression into compact BF16 works."""
+    ...

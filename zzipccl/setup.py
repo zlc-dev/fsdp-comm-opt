@@ -1,7 +1,6 @@
 """Build script for hopper_fastzip2 – SM90-optimized ZipCCL kernels (multi-work
 compress optimized: per-block work lookup is O(1) and the deterministic stream
 is written compacted directly, so 8/16-work throughput stays close to 1-work)."""
-import torch
 import os
 import sys
 import platform as pf
@@ -33,7 +32,7 @@ def install():
     ext_args += ["-DUSE_GPU"]
 
     nvcc_flags = [
-        "-arch=sm_120",
+        "-arch=sm_89",
         "-std=c++17",
         "--expt-relaxed-constexpr",
         "-O3",
