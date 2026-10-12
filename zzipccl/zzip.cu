@@ -206,26 +206,41 @@ __global__ void hopper_compress_split_store_pad_kernel(
         b2 |= ((code >> 2) & 1u) << j;
     }
 
-    // --- prefix-sum of zero counts ---
-    int thread_zero_count = __popc(~b0 & ~b1 & ~b2);
+    // Pair code-0 exponents with otherwise-unused code-7 sign/mantissa bytes
+    // from the same thread. Any unpaired code-0 values remain in the outlier
+    // stream. Pairing by increasing element index makes the mapping implicit.
+    uint32_t overflow_mask = ~b0 & ~b1 & ~b2;
+    uint32_t free_slot_mask = b0 & b1 & b2;
+    while (overflow_mask && free_slot_mask) {
+        int zero_bit = __ffs(overflow_mask) - 1;
+        int slot_bit = __ffs(free_slot_mask) - 1;
+        sm_local[slot_bit] = exp_local[zero_bit];
+        overflow_mask &= (overflow_mask - 1);
+        free_slot_mask &= (free_slot_mask - 1);
+    }
+
+    // --- prefix-sum of outlier spill counts ---
+    int thread_spill_count = __popc(overflow_mask);
     unsigned active_mask = __activemask();
-    int val = thread_zero_count;
+    int val_spill = thread_spill_count;
     #pragma unroll
     for (int offset = 1; offset < 32; offset <<= 1) {
-        int tmp = __shfl_up_sync(active_mask, val, offset);
-        if (lane >= offset) val += tmp;
+        int tmp = __shfl_up_sync(active_mask, val_spill, offset);
+        if (lane >= offset) val_spill += tmp;
     }
-    int warp_prefix = val - thread_zero_count;
+    int warp_spill_prefix = val_spill - thread_spill_count;
 
-    __shared__ int warp_totals[BLOCK_SIZE / WARP_SIZE];
+    __shared__ int warp_spill_totals[BLOCK_SIZE / WARP_SIZE];
     __shared__ int block_base_global;
-    if (lane == WARP_SIZE - 1) warp_totals[warp_id] = val;
+    if (lane == WARP_SIZE - 1) warp_spill_totals[warp_id] = val_spill;
     __syncthreads();
 
     if (warp_id == 0 && lane == 0) {
         int run = 0;
         for (int w = 0; w < BLOCK_SIZE / WARP_SIZE; ++w) {
-            int t = warp_totals[w]; warp_totals[w] = run; run += t;
+            int t = warp_spill_totals[w];
+            warp_spill_totals[w] = run;
+            run += t;
         }
         block_base_global = atomicAdd(global_zero_counter_8 + my_i, run);
     }
@@ -259,8 +274,8 @@ __global__ void hopper_compress_split_store_pad_kernel(
 
     // --- outlier stream ---
     unsigned char* non_compress_exp = output1 + my_extra_off;
-    int pos = block_base_global + warp_totals[warp_id] + warp_prefix;
-    uint32_t m = ~b0 & ~b1 & ~b2;
+    int pos = block_base_global + warp_spill_totals[warp_id] + warp_spill_prefix;
+    uint32_t m = overflow_mask;
     while (m) {
         int bit = __ffs(m) - 1;
         non_compress_exp[pos++] = exp_local[bit];
@@ -340,19 +355,24 @@ __global__ void hopper_decompress_split_store_unpad_kernel(
             *reinterpret_cast<float4*>(local_sm)      = *reinterpret_cast<const float4*>(my_sm);
             *reinterpret_cast<float4*>(local_sm + 16)  = *reinterpret_cast<const float4*>(my_sm + 16);
 
-            int thread_zero_count = __popc(~lb0 & ~lb1 & ~lb2);
+            uint32_t zero_mask = ~lb0 & ~lb1 & ~lb2;
+            uint32_t seven_mask = lb0 & lb1 & lb2;
+            int thread_zero_count = __popc(zero_mask);
+            int thread_seven_count = __popc(seven_mask);
+            int thread_paired_count = min(thread_zero_count, thread_seven_count);
+            int thread_spill_count = thread_zero_count - thread_paired_count;
 
             unsigned active_mask = __activemask();
-            int val2 = thread_zero_count;
+            int val2 = thread_spill_count;
             #pragma unroll
             for (int offset = 1; offset < 32; offset <<= 1) {
                 int t = __shfl_up_sync(active_mask, val2, offset);
                 if (lane >= offset) val2 += t;
             }
-            int warp_prefix = val2 - thread_zero_count;
+            int warp_prefix = val2 - thread_spill_count;
 
             __shared__ int warp_totals[BLOCK_SIZE / WARP_SIZE];
-            __shared__ int block_zero_count;
+            __shared__ int block_spill_count;
             if (lane == WARP_SIZE - 1)
                 warp_totals[warp_id] = val2;
             __syncthreads();
@@ -364,20 +384,21 @@ __global__ void hopper_decompress_split_store_unpad_kernel(
                     warp_totals[w] = run;
                     run += t;
                 }
-                block_zero_count = run;
+                block_spill_count = run;
             }
             __syncthreads();
 
             int block_start = block_offsets[real_n_block];
             int thread_exp_start = warp_totals[warp_id] + warp_prefix;
 
-            int nce_total = block_zero_count;
+            int nce_total = block_spill_count;
             for (int idx = tid; idx < nce_total; idx += BLOCK_SIZE) {
                 smem_nce[idx] = nce_ptr[block_start + idx];
             }
             __syncthreads();
 
-            uint32_t hfi = ~(lb0 | lb1 | lb2);
+            uint32_t available_slots = seven_mask;
+            int zero_rank = 0;
             __nv_bfloat16 out_reg[PACK];
 
             #pragma unroll
@@ -391,9 +412,15 @@ __global__ void hopper_decompress_split_store_unpad_kernel(
 
                 unsigned char exp_val;
                 if (code == 0) {
-                    uint32_t mask_before = (1u << bit) - 1;
-                    int zero_before = __popc(hfi & mask_before);
-                    exp_val = smem_nce[thread_exp_start + zero_before];
+                    if (zero_rank < thread_paired_count) {
+                        int slot_bit = __ffs(available_slots) - 1;
+                        exp_val = local_sm[slot_bit];
+                        available_slots &= (available_slots - 1);
+                    } else {
+                        exp_val = smem_nce[
+                            thread_exp_start + zero_rank - thread_paired_count];
+                    }
+                    ++zero_rank;
                 } else if (code == 7u) {
                     exp_val = 0;
                     lsm = 0;
