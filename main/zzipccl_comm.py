@@ -12,8 +12,15 @@ def _align(value: int, alignment: int = 128) -> int:
 
 class ZZipCCLAllGather:
 
-    def __init__(self, min_compress_numel: int = 0):
+    def __init__(self, min_compress_numel: int = 0, reuse: bool = False):
         self.min_compress_numel = min_compress_numel
+        self.reuse = reuse
+        self._compress = (
+            zzip.hopper2_compress if reuse else zzip.hopper_compress
+        )
+        self._decompress = (
+            zzip.hopper2_decompress if reuse else zzip.hopper_decompress
+        )
 
     def allocate(self, size, *, dtype, device):
         return torch.empty(size, dtype=dtype, device=device)
@@ -70,7 +77,7 @@ class ZZipCCLAllGather:
             padded_numel, dtype=torch.uint8, device=device
         )
 
-        zzip.hopper_compress(
+        self._compress(
             input_flat,
             n_8_local,
             orig_n_8_local,
@@ -135,7 +142,7 @@ class ZZipCCLAllGather:
                 )
                 zero_offset += zero_bytes
 
-        zzip.hopper_decompress(
+        self._decompress(
             det_recv,
             zero_input,
             n_8_all,

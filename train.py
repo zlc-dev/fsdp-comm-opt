@@ -68,6 +68,8 @@ LOGGER = logging.getLogger(__name__)
 def set_custom_all_gather(m: FSDPModule, args: argparse.Namespace):
     if args.quantize_name == "zzipccl":
         m.set_custom_all_gather(ZZipCCLAllGather())
+    elif args.quantize_name == "zzipccl2":
+        m.set_custom_all_gather(ZZipCCLAllGather(reuse=True))
     else:
         m.set_custom_all_gather(ZipCCLAllGather())
 
@@ -529,7 +531,11 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profiler-active", default=3, type=int)
     parser.add_argument("--forward-prefetch-distance", default=1, type=int)
     parser.add_argument("-q", "--quantize", default=False, action="store_true")
-    parser.add_argument("--quantize-name", default=None)
+    parser.add_argument(
+        "--quantize-name",
+        choices=("zipccl", "zzipccl", "zzipccl2"),
+        default=None,
+    )
     parser.add_argument(
         "--wandb",
         action="store_true",

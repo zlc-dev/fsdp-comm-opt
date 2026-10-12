@@ -102,6 +102,7 @@ __global__ void hopper_copy_zero_kernel(
     }
 }
 
+template <bool REUSE_CODE7_SLOTS>
 __global__ void hopper_compress_split_store_pad_kernel(
     const rptr<__nv_bfloat16> input,
     rptr<unsigned char> output,
@@ -200,23 +201,26 @@ __global__ void hopper_compress_split_store_pad_kernel(
     for (int j = 0; j < 32; ++j) {
         int e = static_cast<int>(exp_local[j]);
         unsigned int code = (e >= best_i && e < best_i + 6) ? (e - best_i + 1) : 0u;
-        code = (code == 0u && e < 117) ? 7u : code;
+        code = (code == 0u && e < 110) ? 7u : code;
         b0 |= ((code >> 0) & 1u) << j;
         b1 |= ((code >> 1) & 1u) << j;
         b2 |= ((code >> 2) & 1u) << j;
     }
 
-    // Pair code-0 exponents with otherwise-unused code-7 sign/mantissa bytes
-    // from the same thread. Any unpaired code-0 values remain in the outlier
-    // stream. Pairing by increasing element index makes the mapping implicit.
     uint32_t overflow_mask = ~b0 & ~b1 & ~b2;
-    uint32_t free_slot_mask = b0 & b1 & b2;
-    while (overflow_mask && free_slot_mask) {
-        int zero_bit = __ffs(overflow_mask) - 1;
-        int slot_bit = __ffs(free_slot_mask) - 1;
-        sm_local[slot_bit] = exp_local[zero_bit];
-        overflow_mask &= (overflow_mask - 1);
-        free_slot_mask &= (free_slot_mask - 1);
+    if constexpr (REUSE_CODE7_SLOTS) {
+        // Pair code-0 exponents with code-7 sign/mantissa bytes from this
+        // thread. Increasing-index pairing keeps the mapping implicit.
+        uint32_t free_slot_mask = b0 & b1 & b2;
+        uint32_t paired_mask = overflow_mask;
+        while (paired_mask && free_slot_mask) {
+            int zero_bit = __ffs(paired_mask) - 1;
+            int slot_bit = __ffs(free_slot_mask) - 1;
+            sm_local[slot_bit] = exp_local[zero_bit];
+            paired_mask &= (paired_mask - 1);
+            free_slot_mask &= (free_slot_mask - 1);
+        }
+        overflow_mask = paired_mask;
     }
 
     // --- prefix-sum of outlier spill counts ---
@@ -288,6 +292,7 @@ __global__ void hopper_compress_split_store_pad_kernel(
 // a compacted output (skipping per-work padding), so no post-decompress
 // copy is needed. Each work's valid data starts at i * orig_ele_num.
 // =========================================================
+template <bool REUSE_CODE7_SLOTS>
 __global__ void hopper_decompress_split_store_unpad_kernel(
     const rptr<unsigned char> compressed_input,
     const rptr<unsigned char> zero_input,
@@ -358,8 +363,9 @@ __global__ void hopper_decompress_split_store_unpad_kernel(
             uint32_t zero_mask = ~lb0 & ~lb1 & ~lb2;
             uint32_t seven_mask = lb0 & lb1 & lb2;
             int thread_zero_count = __popc(zero_mask);
-            int thread_seven_count = __popc(seven_mask);
-            int thread_paired_count = min(thread_zero_count, thread_seven_count);
+            int thread_paired_count = REUSE_CODE7_SLOTS
+                ? min(thread_zero_count, __popc(seven_mask))
+                : 0;
             int thread_spill_count = thread_zero_count - thread_paired_count;
 
             unsigned active_mask = __activemask();
@@ -412,13 +418,17 @@ __global__ void hopper_decompress_split_store_unpad_kernel(
 
                 unsigned char exp_val;
                 if (code == 0) {
-                    if (zero_rank < thread_paired_count) {
-                        int slot_bit = __ffs(available_slots) - 1;
-                        exp_val = local_sm[slot_bit];
-                        available_slots &= (available_slots - 1);
+                    if constexpr (REUSE_CODE7_SLOTS) {
+                        if (zero_rank < thread_paired_count) {
+                            int slot_bit = __ffs(available_slots) - 1;
+                            exp_val = local_sm[slot_bit];
+                            available_slots &= (available_slots - 1);
+                        } else {
+                            exp_val = smem_nce[
+                                thread_exp_start + zero_rank - thread_paired_count];
+                        }
                     } else {
-                        exp_val = smem_nce[
-                            thread_exp_start + zero_rank - thread_paired_count];
+                        exp_val = smem_nce[thread_exp_start + zero_rank];
                     }
                     ++zero_rank;
                 } else if (code == 7u) {
@@ -1034,7 +1044,7 @@ void hopper_compress_split_store_pad_api_8(
     cudaMemsetAsync(zero_count_8, 0, n_works * sizeof(int), stream);
     if (blocks == 0) return;
 
-    hopper_compress_split_store_pad_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
+    hopper_compress_split_store_pad_kernel<false><<<blocks, BLOCK_SIZE, 0, stream>>>(
         input, output, staging, n_8, orig_n_8, zero_count_8,
         bases_in, n_works);
 
@@ -1055,9 +1065,48 @@ void hopper_decompress_split_store_unpad_api_8(
     if (blocks == 0) return;
 
     size_t smem = ELEMS_PER_BLOCK * sizeof(unsigned char);
-    cudaFuncSetAttribute(hopper_decompress_split_store_unpad_kernel,
+    cudaFuncSetAttribute(hopper_decompress_split_store_unpad_kernel<false>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem + 1024);
-    hopper_decompress_split_store_unpad_kernel<<<blocks, BLOCK_SIZE, smem, stream>>>(
+    hopper_decompress_split_store_unpad_kernel<false><<<blocks, BLOCK_SIZE, smem, stream>>>(
+        compressed_input, zero_input, zero_count_8, n_8,
+        output, n_works, orig_ele_num);
+}
+
+void hopper2_compress_split_store_pad_api_8(
+    __nv_bfloat16* input, unsigned char* output,
+    unsigned char* staging, unsigned char* zero_output,
+    int* n_8, int* orig_n_8, int* zero_count_8, int* bases_in,
+    int padded_n_total, int n_works)
+{
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    int blocks = padded_n_total / ELEMS_PER_BLOCK;
+    cudaMemsetAsync(zero_count_8, 0, n_works * sizeof(int), stream);
+    if (blocks == 0) return;
+
+    hopper_compress_split_store_pad_kernel<true><<<blocks, BLOCK_SIZE, 0, stream>>>(
+        input, output, staging, n_8, orig_n_8, zero_count_8,
+        bases_in, n_works);
+
+    size_t smem = COPY_CHUNK;
+    cudaFuncSetAttribute(hopper_copy_zero_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem + 1024);
+    hopper_copy_zero_kernel<<<blocks, COPY_BLK, smem, stream>>>(
+        staging, zero_output, n_8, zero_count_8, n_works);
+}
+
+void hopper2_decompress_split_store_unpad_api_8(
+    unsigned char* compressed_input, unsigned char* zero_input,
+    int* zero_count_8, int* n_8, __nv_bfloat16* output,
+    int padded_n_total, int orig_ele_num, int n_works)
+{
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    int blocks = padded_n_total / ELEMS_PER_BLOCK;
+    if (blocks == 0) return;
+
+    size_t smem = ELEMS_PER_BLOCK * sizeof(unsigned char);
+    cudaFuncSetAttribute(hopper_decompress_split_store_unpad_kernel<true>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem + 1024);
+    hopper_decompress_split_store_unpad_kernel<true><<<blocks, BLOCK_SIZE, smem, stream>>>(
         compressed_input, zero_input, zero_count_8, n_8,
         output, n_works, orig_ele_num);
 }

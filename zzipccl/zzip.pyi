@@ -93,3 +93,37 @@ def hopper_decompress(
 ) -> None:
     """Run Hopper split-store decompression into compact BF16 works."""
     ...
+
+
+def hopper2_compress(
+    input: torch.Tensor,
+    n_8: torch.Tensor,
+    orig_n_8: torch.Tensor,
+    bases_in: torch.Tensor,
+    compressed_output: torch.Tensor,
+    staging: torch.Tensor,
+    zero_output: torch.Tensor,
+    zero_count_8: torch.Tensor,
+    padded_n_total: int,
+    n_works: int,
+) -> None:
+    """Run Hopper2 compression with thread-local code-7 slot reuse.
+
+    ``zero_count_8`` contains only code-0 exponents that could not be paired
+    with a code-7 slot in the same thread. The resulting streams must be
+    decoded with ``hopper2_decompress``.
+    """
+    ...
+
+
+def hopper2_decompress(
+    compressed_input: torch.Tensor,
+    zero_input: torch.Tensor,
+    n_8: torch.Tensor,
+    zero_count_8: torch.Tensor,
+    output: torch.Tensor,
+    orig_ele_num: int,
+    n_works: int,
+) -> None:
+    """Decode Hopper2 streams into compact BF16 works."""
+    ...
