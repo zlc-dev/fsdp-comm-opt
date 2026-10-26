@@ -67,13 +67,21 @@ LOGGER = logging.getLogger(__name__)
 
 def set_custom_all_gather(m: FSDPModule, args: argparse.Namespace):
     if args.quantize_name == "zzipccl":
-        m.set_custom_all_gather(ZZipCCLAllGather())
-        m.set_custom_reduce_scatter(ZZipCCLReduceScatter())
+        # m.set_custom_all_gather(
+        #     ZZipCCLAllGather(zero_threshold=1e-3)
+        # )
+        m.set_custom_reduce_scatter(
+            ZZipCCLReduceScatter(zero_threshold=1e-5)
+        )
     elif args.quantize_name == "zzipccl2":
-        m.set_custom_all_gather(ZZipCCLAllGather(reuse=True))
-        m.set_custom_reduce_scatter(ZZipCCLReduceScatter(reuse=True))
+        # m.set_custom_all_gather(
+        #     ZZipCCLAllGather(reuse=True, zero_threshold=1e-3)
+        # )
+        m.set_custom_reduce_scatter(
+            ZZipCCLReduceScatter(reuse=True, zero_threshold=1e-5)
+        )
     else:
-        m.set_custom_all_gather(ZipCCLAllGather())
+        # m.set_custom_all_gather(ZipCCLAllGather())
         m.set_custom_reduce_scatter(ZipCCLReduceScatter())
 
 @record

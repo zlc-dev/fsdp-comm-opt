@@ -13,6 +13,7 @@ void hopper_compress_split_store_pad_api_8(
     int* orig_n_8,
     int* zero_count_8,
     int* bases_in,
+    float* zero_threshold,
     int padded_n_total,
     int n_works);
 
@@ -35,6 +36,7 @@ void hopper2_compress_split_store_pad_api_8(
     int* orig_n_8,
     int* zero_count_8,
     int* bases_in,
+    float* zero_threshold,
     int padded_n_total,
     int n_works);
 
@@ -108,6 +110,7 @@ void hopper_compress(
     torch::Tensor staging,
     torch::Tensor zero_output,
     torch::Tensor zero_count_8,
+    torch::Tensor zero_threshold,
     int padded_n_total,
     int n_works)
 {
@@ -119,6 +122,7 @@ void hopper_compress(
     check_tensor(staging, "staging", torch::kUInt8);
     check_tensor(zero_output, "zero_output", torch::kUInt8);
     check_tensor(zero_count_8, "zero_count_8", torch::kInt32);
+    check_tensor(zero_threshold, "zero_threshold", torch::kFloat32);
     TORCH_CHECK(n_works > 0, "n_works must be positive");
     TORCH_CHECK(padded_n_total >= 0, "padded_n_total must be non-negative");
     TORCH_CHECK(padded_n_total % kElemsPerBlock == 0,
@@ -129,6 +133,8 @@ void hopper_compress(
     TORCH_CHECK(zero_count_8.numel() >= n_works,
                 "zero_count_8 must contain n_works entries");
     TORCH_CHECK(bases_in.numel() >= 1, "bases_in must not be empty");
+    TORCH_CHECK(zero_threshold.numel() == 1,
+                "zero_threshold must contain exactly one value");
     TORCH_CHECK(compressed_output.numel() >= padded_n_total,
                 "compressed_output must have at least padded_n_total bytes");
     TORCH_CHECK(staging.numel() >= padded_n_total,
@@ -142,6 +148,7 @@ void hopper_compress(
     check_same_device(staging, input, "staging");
     check_same_device(zero_output, input, "zero_output");
     check_same_device(zero_count_8, input, "zero_count_8");
+    check_same_device(zero_threshold, input, "zero_threshold");
 
     hopper_compress_split_store_pad_api_8(
         reinterpret_cast<__nv_bfloat16*>(input.data_ptr<torch::BFloat16>()),
@@ -152,6 +159,7 @@ void hopper_compress(
         orig_n_8.data_ptr<int>(),
         zero_count_8.data_ptr<int>(),
         bases_in.data_ptr<int>(),
+        zero_threshold.data_ptr<float>(),
         padded_n_total,
         n_works);
 }
@@ -210,6 +218,7 @@ void hopper2_compress(
     torch::Tensor staging,
     torch::Tensor zero_output,
     torch::Tensor zero_count_8,
+    torch::Tensor zero_threshold,
     int padded_n_total,
     int n_works)
 {
@@ -221,6 +230,7 @@ void hopper2_compress(
     check_tensor(staging, "staging", torch::kUInt8);
     check_tensor(zero_output, "zero_output", torch::kUInt8);
     check_tensor(zero_count_8, "zero_count_8", torch::kInt32);
+    check_tensor(zero_threshold, "zero_threshold", torch::kFloat32);
     TORCH_CHECK(n_works > 0, "n_works must be positive");
     TORCH_CHECK(padded_n_total >= 0, "padded_n_total must be non-negative");
     TORCH_CHECK(padded_n_total % kElemsPerBlock == 0,
@@ -231,6 +241,8 @@ void hopper2_compress(
     TORCH_CHECK(zero_count_8.numel() >= n_works,
                 "zero_count_8 must contain n_works entries");
     TORCH_CHECK(bases_in.numel() >= 1, "bases_in must not be empty");
+    TORCH_CHECK(zero_threshold.numel() == 1,
+                "zero_threshold must contain exactly one value");
     TORCH_CHECK(compressed_output.numel() >= padded_n_total,
                 "compressed_output must have at least padded_n_total bytes");
     TORCH_CHECK(staging.numel() >= padded_n_total,
@@ -244,6 +256,7 @@ void hopper2_compress(
     check_same_device(staging, input, "staging");
     check_same_device(zero_output, input, "zero_output");
     check_same_device(zero_count_8, input, "zero_count_8");
+    check_same_device(zero_threshold, input, "zero_threshold");
 
     hopper2_compress_split_store_pad_api_8(
         reinterpret_cast<__nv_bfloat16*>(input.data_ptr<torch::BFloat16>()),
@@ -254,6 +267,7 @@ void hopper2_compress(
         orig_n_8.data_ptr<int>(),
         zero_count_8.data_ptr<int>(),
         bases_in.data_ptr<int>(),
+        zero_threshold.data_ptr<float>(),
         padded_n_total,
         n_works);
 }

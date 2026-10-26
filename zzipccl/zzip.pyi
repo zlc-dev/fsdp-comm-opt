@@ -11,6 +11,7 @@ def hopper_compress(
     staging: torch.Tensor,
     zero_output: torch.Tensor,
     zero_count_8: torch.Tensor,
+    zero_threshold: torch.Tensor,
     padded_n_total: int,
     n_works: int,
 ) -> None:
@@ -18,7 +19,8 @@ def hopper_compress(
 
     ``zero_count_8`` is reset and then overwritten with each work's outlier
     count. ``staging`` and ``zero_output`` each need at least
-    ``padded_n_total`` bytes.
+    ``padded_n_total`` bytes. ``zero_threshold`` is a scalar CUDA float32
+    tensor containing the code-7 near-zero cutoff.
     """
     ...
 
@@ -45,6 +47,7 @@ def hopper2_compress(
     staging: torch.Tensor,
     zero_output: torch.Tensor,
     zero_count_8: torch.Tensor,
+    zero_threshold: torch.Tensor,
     padded_n_total: int,
     n_works: int,
 ) -> None:

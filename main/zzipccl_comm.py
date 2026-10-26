@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.distributed as dist
 
@@ -12,9 +14,17 @@ def _align(value: int, alignment: int = 128) -> int:
 
 class ZZipCCLAllGather:
 
-    def __init__(self, min_compress_numel: int = 0, reuse: bool = False):
+    def __init__(
+        self,
+        min_compress_numel: int = 0,
+        reuse: bool = False,
+        zero_threshold: float = 2**-12,
+    ):
+        if not math.isfinite(zero_threshold) or zero_threshold < 0:
+            raise ValueError("zero_threshold must be a finite, non-negative value")
         self.min_compress_numel = min_compress_numel
         self.reuse = reuse
+        self.zero_threshold = zero_threshold
         self._compress = (
             zzip.hopper2_compress if reuse else zzip.hopper_compress
         )
@@ -70,7 +80,9 @@ class ZZipCCLAllGather:
         bases_in = torch.clamp(best_i, 0, 249).to(torch.int32).reshape(1)
 
         zero_count_local = torch.zeros(1, dtype=torch.int32, device=device)
-
+        zero_threshold = torch.tensor(
+            [self.zero_threshold], dtype=torch.float32, device=device
+        )
         det_send = torch.empty(det_bytes, dtype=torch.uint8, device=device)
         zero_tmp = torch.empty(padded_numel, dtype=torch.uint8, device=device)
         zero_send_compact = torch.empty(
@@ -86,6 +98,7 @@ class ZZipCCLAllGather:
             zero_tmp,
             zero_send_compact,
             zero_count_local,
+            zero_threshold,
             padded_numel,
             1,
         )
@@ -162,6 +175,7 @@ class ZZipCCLAllGather:
             zero_tmp,
             zero_send_compact,
             zero_count_local,
+            zero_threshold,
             det_recv,
             zero_counts,
             zero_send,
@@ -173,12 +187,21 @@ class ZZipCCLAllGather:
 
         return None
 
+
 class ZZipCCLReduceScatter:
     """ZZipCCL reduce-scatter using compressed all-to-all and local reduce."""
 
-    def __init__(self, min_compress_numel: int = 0, reuse: bool = False):
+    def __init__(
+        self,
+        min_compress_numel: int = 0,
+        reuse: bool = False,
+        zero_threshold: float = 2**-12,
+    ):
+        if not math.isfinite(zero_threshold) or zero_threshold < 0:
+            raise ValueError("zero_threshold must be a finite, non-negative value")
         self.min_compress_numel = min_compress_numel
         self.reuse = reuse
+        self.zero_threshold = zero_threshold
         self._compress = (
             zzip.hopper2_compress if reuse else zzip.hopper_compress
         )
@@ -258,6 +281,9 @@ class ZZipCCLReduceScatter:
         zero_counts_send = torch.zeros(
             world_size, dtype=torch.int32, device=device
         )
+        zero_threshold = torch.tensor(
+            [self.zero_threshold], dtype=torch.float32, device=device
+        )
         zero_counts_recv = torch.empty_like(zero_counts_send)
         det_send = torch.empty(
             world_size * det_bytes, dtype=torch.uint8, device=device
@@ -277,6 +303,7 @@ class ZZipCCLReduceScatter:
             zero_staging,
             zero_send,
             zero_counts_send,
+            zero_threshold,
             padded_total_numel,
             world_size,
         )
@@ -345,6 +372,7 @@ class ZZipCCLReduceScatter:
             orig_n_8,
             bases_in,
             zero_counts_send,
+            zero_threshold,
             zero_counts_recv,
             det_send,
             det_recv,

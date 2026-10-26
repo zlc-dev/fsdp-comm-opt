@@ -111,6 +111,7 @@ __global__ void hopper_compress_split_store_pad_kernel(
     rptr<int> orig_n_8,
     rptr<int> global_zero_counter_8,
     rptr<int> bases_in,
+    rptr<float> zero_threshold,
     int n_works)
 {
     extern __shared__ __align__(128) uint8_t reuse_smem[];
@@ -127,7 +128,13 @@ __global__ void hopper_compress_split_store_pad_kernel(
     __shared__ int s_i, s_real_n_block, s_local_n_8, s_current_n_block;
     __shared__ int s_normal_off, s_extra_off, s_orig;
     __shared__ size_t s_input_off;
+    __shared__ unsigned short s_zero_threshold_bits;
     if (tid == 0) {
+        const __nv_bfloat16 threshold_bf16 =
+            __float2bfloat16_ru(zero_threshold[0]);
+        s_zero_threshold_bits =
+            *reinterpret_cast<const unsigned short*>(&threshold_bf16) & 0x7FFFu;
+
         int tmp_blk = 0, normal_off = 0, extra_off = 0, found = -1;
         size_t input_off = 0;
         for (int i = 0; i < n_works; ++i) {
@@ -155,6 +162,7 @@ __global__ void hopper_compress_split_store_pad_kernel(
         s_i = found;
     }
     __syncthreads();
+    const unsigned short zero_threshold_bits = s_zero_threshold_bits;
     int my_i = s_i;
     if (my_i < 0) return;
     int my_real_n_block = s_real_n_block;
@@ -203,7 +211,8 @@ __global__ void hopper_compress_split_store_pad_kernel(
     for (int j = 0; j < 32; ++j) {
         int e = static_cast<int>(exp_local[j]);
         unsigned int code = (e >= best_i && e < best_i + 6) ? (e - best_i + 1) : 0u;
-        code = (code == 0u && e < 115) ? 7u : code;
+        unsigned short magnitude_bits = p[j] & 0x7FFFu;
+        code = (code == 0u && magnitude_bits < zero_threshold_bits) ? 7u : code;
         b0 |= ((code >> 0) & 1u) << j;
         b1 |= ((code >> 1) & 1u) << j;
         b2 |= ((code >> 2) & 1u) << j;
@@ -542,6 +551,7 @@ void hopper_compress_split_store_pad_api_8(
     __nv_bfloat16* input, unsigned char* output,
     unsigned char* staging, unsigned char* zero_output,
     int* n_8, int* orig_n_8, int* zero_count_8, int* bases_in,
+    float* zero_threshold,
     int padded_n_total, int n_works)
 {
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
@@ -551,7 +561,7 @@ void hopper_compress_split_store_pad_api_8(
 
     hopper_compress_split_store_pad_kernel<false><<<blocks, BLOCK_SIZE, 0, stream>>>(
         input, output, staging, n_8, orig_n_8, zero_count_8,
-        bases_in, n_works);
+        bases_in, zero_threshold, n_works);
 
     size_t smem = COPY_CHUNK;
     cudaFuncSetAttribute(hopper_copy_zero_kernel,
@@ -581,6 +591,7 @@ void hopper2_compress_split_store_pad_api_8(
     __nv_bfloat16* input, unsigned char* output,
     unsigned char* staging, unsigned char* zero_output,
     int* n_8, int* orig_n_8, int* zero_count_8, int* bases_in,
+    float* zero_threshold,
     int padded_n_total, int n_works)
 {
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
@@ -592,7 +603,7 @@ void hopper2_compress_split_store_pad_api_8(
     hopper_compress_split_store_pad_kernel<true><<<
         blocks, BLOCK_SIZE, reuse_smem, stream>>>(
         input, output, staging, n_8, orig_n_8, zero_count_8,
-        bases_in, n_works);
+        bases_in, zero_threshold, n_works);
 
     size_t smem = COPY_CHUNK;
     cudaFuncSetAttribute(hopper_copy_zero_kernel,
