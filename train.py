@@ -36,8 +36,8 @@ import wandb
 # fixes for reset_parameters not existing
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
-from main.zipccl_comm import ZipCCLAllGather
-from main.zzipccl_comm import ZZipCCLAllGather
+from main.zipccl_comm import ZipCCLAllGather, ZipCCLReduceScatter
+from main.zzipccl_comm import ZZipCCLAllGather, ZZipCCLReduceScatter
 
 def reset_rope(self: LlamaRotaryEmbedding):
     rope_init_fn = getattr(self, "rope_init_fn", None)
@@ -68,10 +68,13 @@ LOGGER = logging.getLogger(__name__)
 def set_custom_all_gather(m: FSDPModule, args: argparse.Namespace):
     if args.quantize_name == "zzipccl":
         m.set_custom_all_gather(ZZipCCLAllGather())
+        m.set_custom_reduce_scatter(ZZipCCLReduceScatter())
     elif args.quantize_name == "zzipccl2":
         m.set_custom_all_gather(ZZipCCLAllGather(reuse=True))
+        m.set_custom_reduce_scatter(ZZipCCLReduceScatter(reuse=True))
     else:
         m.set_custom_all_gather(ZipCCLAllGather())
+        m.set_custom_reduce_scatter(ZipCCLReduceScatter())
 
 @record
 def main():
