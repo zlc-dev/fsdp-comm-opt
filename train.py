@@ -249,6 +249,13 @@ def main():
         args.profiler_wait + args.profiler_warmup + args.profiler_active
     )
     profiler_finished = False
+    max_steps_reached = state["global_step"] >= args.max_step
+    if max_steps_reached:
+        LOGGER.info(
+            "Global step %d has already reached max step %d; skipping training",
+            state["global_step"],
+            args.max_step,
+        )
     with torch.profiler.profile(
         activities=[
             ProfilerActivity.CPU,
@@ -270,6 +277,9 @@ def main():
     ) if enable_profiler else contextlib.nullcontext() as prof:
         
         for state["epoch"] in range(state["epoch"], args.num_epochs):
+            if max_steps_reached:
+                break
+
             LOGGER.info(f"Begin epoch {state['epoch']} at step {state['epoch_step']}")
 
             progress_bar = tqdm.tqdm(range(len(dataloader)), disable=rank > 0)
@@ -394,7 +404,15 @@ def main():
                             json.dump(state, fp)
                     dist.barrier()
 
-            if profiler_finished:
+                if state["global_step"] >= args.max_step:
+                    LOGGER.info(
+                        "Reached max step %d; stopping training", args.max_step
+                    )
+                    max_steps_reached = True
+                    progress_bar.close()
+                    break
+
+            if profiler_finished or max_steps_reached:
                 break
 
             state["epoch_step"] = 0
@@ -550,6 +568,12 @@ def _get_parser() -> argparse.ArgumentParser:
         "--wandb-mode",
         choices=("online", "offline", "disabled"),
         default="online",
+    )
+    parser.add_argument(
+        "--max-step",
+        default=500,
+        type=int,
+        help="maximum number of optimizer steps to run, including resumed steps",
     )
     return parser
 
