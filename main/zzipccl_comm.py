@@ -189,19 +189,31 @@ class ZZipCCLAllGather:
 
 
 class ZZipCCLReduceScatter:
-    """ZZipCCL reduce-scatter using compressed all-to-all and local reduce."""
+    """ZZipCCL reduce-scatter using compressed all-to-all and local reduce.
+
+    When ``local_error_feedback`` is enabled, the compression error made by
+    this rank is retained in bfloat16 and added to the next BF16 input before
+    it is compressed.  The residual covers ZZip's lossy near-zero encoding.
+    Each instance owns its residual, which matches FSDP's use of one
+    collective object per sharded module.
+    """
 
     def __init__(
         self,
         min_compress_numel: int = 0,
         reuse: bool = False,
         zero_threshold: float = 2**-12,
+        local_error_feedback: bool = True,
     ):
         if not math.isfinite(zero_threshold) or zero_threshold < 0:
             raise ValueError("zero_threshold must be a finite, non-negative value")
         self.min_compress_numel = min_compress_numel
         self.reuse = reuse
         self.zero_threshold = zero_threshold
+        self.local_error_feedback = local_error_feedback
+        self._local_error: torch.Tensor | None = None
+        self._local_error_input_dtype: torch.dtype | None = None
+        self._local_error_world_size: int | None = None
         self._compress = (
             zzip.hopper2_compress if reuse else zzip.hopper_compress
         )
@@ -211,6 +223,36 @@ class ZZipCCLReduceScatter:
 
     def allocate(self, size, *, dtype, device):
         return torch.empty(size, dtype=dtype, device=device)
+
+    def reset_error_feedback(self) -> None:
+        """Discard the locally accumulated compression residual."""
+        self._local_error = None
+        self._local_error_input_dtype = None
+        self._local_error_world_size = None
+
+    def _compensated_input(
+        self, input_tensor: torch.Tensor, world_size: int
+    ) -> torch.Tensor:
+        input_flat = input_tensor.contiguous().view(-1)
+        if not self.local_error_feedback:
+            return input_flat.to(torch.bfloat16)
+
+        if (
+            self._local_error is None
+            or self._local_error.shape != input_flat.shape
+            or self._local_error.device != input_flat.device
+            or self._local_error_input_dtype != input_flat.dtype
+            or self._local_error_world_size != world_size
+        ):
+            self._local_error = torch.zeros_like(input_flat, dtype=torch.bfloat16)
+            self._local_error_input_dtype = input_flat.dtype
+            self._local_error_world_size = world_size
+
+        # Use a distinct BF16 buffer so the FSDP input is not modified.
+        compensated = torch.empty_like(input_flat, dtype=torch.bfloat16)
+        compensated.copy_(input_flat.detach())
+        compensated.add_(self._local_error)
+        return compensated
 
     @staticmethod
     def _supported_op(op) -> bool:
@@ -262,7 +304,7 @@ class ZZipCCLReduceScatter:
         )
         det_split_sizes = [det_bytes] * world_size
 
-        input_bf16 = input_tensor.contiguous().view(-1).to(torch.bfloat16)
+        input_bf16 = self._compensated_input(input_tensor, world_size)
         n_8 = torch.full(
             (world_size,),
             padded_shard_numel,
@@ -308,6 +350,8 @@ class ZZipCCLReduceScatter:
             world_size,
         )
 
+        # Start the fixed-size exchanges first so the local residual decode
+        # can overlap with communication on NCCL's stream.
         count_work = dist.all_to_all_single(
             zero_counts_recv,
             zero_counts_send,
@@ -322,6 +366,24 @@ class ZZipCCLReduceScatter:
             group=group,
             async_op=True,
         )
+
+        local_decompressed = None
+        if self.local_error_feedback:
+            # Decode our own just-produced streams locally.  This gives the
+            # exact values put on the wire for every destination without any
+            # extra communication, so the next call can feed back x - Q(x).
+            local_decompressed = torch.empty_like(input_bf16)
+            self._decompress(
+                det_send,
+                zero_send,
+                n_8,
+                zero_counts_send,
+                local_decompressed,
+                shard_numel,
+                world_size,
+            )
+            assert self._local_error is not None
+            self._local_error.copy_(input_bf16 - local_decompressed)
 
         count_work.wait()
         send_counts = zero_counts_send.cpu().tolist()
@@ -383,5 +445,9 @@ class ZZipCCLReduceScatter:
             reduced,
         ):
             tensor.record_stream(stream)
+        if local_decompressed is not None:
+            local_decompressed.record_stream(stream)
+        if self._local_error is not None:
+            self._local_error.record_stream(stream)
 
         return None

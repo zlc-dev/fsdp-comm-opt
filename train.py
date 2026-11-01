@@ -71,14 +71,14 @@ def set_custom_all_gather(m: FSDPModule, args: argparse.Namespace):
         #     ZZipCCLAllGather(zero_threshold=1e-3)
         # )
         m.set_custom_reduce_scatter(
-            ZZipCCLReduceScatter(zero_threshold=1e-5)
+            ZZipCCLReduceScatter(zero_threshold=1e-6)
         )
     elif args.quantize_name == "zzipccl2":
         # m.set_custom_all_gather(
         #     ZZipCCLAllGather(reuse=True, zero_threshold=1e-3)
         # )
         m.set_custom_reduce_scatter(
-            ZZipCCLReduceScatter(reuse=True, zero_threshold=1e-5)
+            ZZipCCLReduceScatter(reuse=True, zero_threshold=1e-6)
         )
     else:
         # m.set_custom_all_gather(ZipCCLAllGather())
