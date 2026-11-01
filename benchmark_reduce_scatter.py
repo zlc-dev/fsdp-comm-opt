@@ -213,7 +213,7 @@ def benchmark_method(
         start = time.perf_counter()
         for _ in range(iters):
             method.reduce_scatter(output, input_tensor, group)
-        torch.cuda.synchronize(input_tensor.device)
+            torch.cuda.synchronize(input_tensor.device)
         elapsed = time.perf_counter() - start
 
         # Collective latency is determined by the slowest participating rank.
@@ -349,13 +349,13 @@ def run(args: argparse.Namespace) -> bool:
                 f"{accuracy.relative_l2:12.5e}"
             )
 
+    input_bytes = input_tensor.numel() * input_tensor.element_size()
     if rank == 0:
-        print("\nPerformance (slowest-rank wall time):")
+        print("\nPerformance (per-call synchronized, slowest-rank wall time):")
         print(
             f"{'method':<14} {'median_ms':>12} {'min_ms':>12} "
             f"{'input_GB/s':>12} {'speedup':>10}"
         )
-    input_bytes = input_tensor.numel() * input_tensor.element_size()
     native_median_ms = None
     for method in methods:
         timings = benchmark_method(
