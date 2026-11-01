@@ -293,7 +293,14 @@ def run(args: argparse.Namespace) -> bool:
     torch.cuda.empty_cache()
 
     zipccl = ZipCCLReduceScatter()
-    zzipccl = ZZipCCLReduceScatter(zero_threshold=args.zero_threshold)
+    zzipccl_ef = ZZipCCLReduceScatter(
+        zero_threshold=args.zero_threshold,
+        local_error_feedback=True,
+    )
+    zzipccl_no_ef = ZZipCCLReduceScatter(
+        zero_threshold=args.zero_threshold,
+        local_error_feedback=False,
+    )
     methods = (
         Method(
             "Native",
@@ -308,18 +315,24 @@ def run(args: argparse.Namespace) -> bool:
             args.compressed_rtol,
         ),
         Method(
-            "ZZipCCL",
-            zzipccl,
+            "ZZipCCL-EF",
+            zzipccl_ef,
             args.compressed_atol,
             args.compressed_rtol,
-            zzipccl.reset_error_feedback,
+            zzipccl_ef.reset_error_feedback,
+        ),
+        Method(
+            "ZZipCCL-NoEF",
+            zzipccl_no_ef,
+            args.compressed_atol,
+            args.compressed_rtol,
         ),
     )
 
     if rank == 0:
         print("\nCorrectness against all-gather reference:")
         print(
-            f"{'method':<10} {'status':<6} {'max_abs':>12} "
+            f"{'method':<14} {'status':<6} {'max_abs':>12} "
             f"{'mean_abs':>12} {'rmse':>12} {'relative_l2':>12}"
         )
     all_passed = True
@@ -331,7 +344,7 @@ def run(args: argparse.Namespace) -> bool:
         if rank == 0:
             status = "PASS" if accuracy.passed else "FAIL"
             print(
-                f"{method.name:<10} {status:<6} {accuracy.max_abs:12.5e} "
+                f"{method.name:<14} {status:<6} {accuracy.max_abs:12.5e} "
                 f"{accuracy.mean_abs:12.5e} {accuracy.rmse:12.5e} "
                 f"{accuracy.relative_l2:12.5e}"
             )
@@ -339,7 +352,7 @@ def run(args: argparse.Namespace) -> bool:
     if rank == 0:
         print("\nPerformance (slowest-rank wall time):")
         print(
-            f"{'method':<10} {'median_ms':>12} {'min_ms':>12} "
+            f"{'method':<14} {'median_ms':>12} {'min_ms':>12} "
             f"{'input_GB/s':>12} {'speedup':>10}"
         )
     input_bytes = input_tensor.numel() * input_tensor.element_size()
@@ -362,7 +375,7 @@ def run(args: argparse.Namespace) -> bool:
         speedup = native_median_ms / median_ms
         if rank == 0:
             print(
-                f"{method.name:<10} {median_ms:12.3f} {min_ms:12.3f} "
+                f"{method.name:<14} {median_ms:12.3f} {min_ms:12.3f} "
                 f"{throughput:12.3f} {speedup:9.3f}x"
             )
 

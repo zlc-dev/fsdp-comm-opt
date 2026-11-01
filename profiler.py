@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent zzipccl/zipccl CUDA kernel benchmark."""
+"""Independent zzipccl/zipccl CUDA kernel and communication-size benchmark."""
 from __future__ import annotations
 
 import argparse
@@ -25,7 +25,41 @@ class BenchmarkInput:
     input: torch.Tensor
     n_8: torch.Tensor
     orig_n_8: torch.Tensor
-    bases: torch.Tensor
+
+
+def estimate_base(input_tensor: torch.Tensor, offset: float) -> torch.Tensor:
+    """Estimate the exponent base from the unpadded input values."""
+    std = input_tensor.std(unbiased=False).float()
+    best_i = torch.round(torch.log2(torch.clamp(std, min=1e-30)) + offset)
+    return torch.clamp(best_i, 0, 249).to(torch.int32).reshape(1)
+
+
+@dataclass(frozen=True)
+class CommunicationStats:
+    original_bytes: int
+    deterministic_bytes: int
+    outlier_bytes: int
+    aligned_outlier_bytes: int
+    metadata_bytes: int = 4
+
+    @property
+    def payload_bytes(self):
+        """Number of meaningful compressed bytes, excluding alignment."""
+        return self.deterministic_bytes + self.outlier_bytes
+
+    @property
+    def wire_bytes(self):
+        """Bytes sent per rank by the corresponding communication classes."""
+        # The collectives use a one-byte buffer when there are no outliers.
+        return (
+            self.deterministic_bytes
+            + max(self.aligned_outlier_bytes, 1)
+            + self.metadata_bytes
+        )
+
+    @property
+    def compression_ratio(self):
+        return self.original_bytes / self.wire_bytes
 
 
 class KernelBenchmark:
@@ -43,8 +77,17 @@ class KernelBenchmark:
     def output(self):
         raise NotImplementedError
 
-    def compression_stats(self):
-        return ""
+    def outlier_count(self):
+        raise NotImplementedError
+
+    def communication_stats(self):
+        outlier_bytes = self.outlier_count()
+        return CommunicationStats(
+            original_bytes=self.data.numel * self.data.input.element_size(),
+            deterministic_bytes=self.compressed.numel(),
+            outlier_bytes=outlier_bytes,
+            aligned_outlier_bytes=align(outlier_bytes),
+        )
 
     def measure(self, operation, warmup, iters, repeats):
         for _ in range(warmup):
@@ -84,33 +127,31 @@ class ZZipCCLBenchmark(KernelBenchmark):
     def __init__(self, data):
         super().__init__(data)
         padded, blocks, device = data.padded, data.padded // ELEMS_PER_BLOCK, data.device
-        det_bytes = align(padded // 8 * 3 + blocks * 4 * 2 + 4)
-        self.threshold = torch.tensor([117], dtype=torch.int32, device=device)
+        det_bytes = align(padded + padded // 8 * 3 + blocks * 4 + 4)
+        self.bases = estimate_base(data.input[:data.numel], 122.52827)
+        self.threshold = torch.tensor([1e-6], dtype=torch.float32, device=device)
         self.compressed = torch.empty(det_bytes, dtype=torch.uint8, device=device)
-        self.staging = torch.empty(2 * padded, dtype=torch.uint8, device=device)
-        self.retained = torch.empty(padded, dtype=torch.uint8, device=device)
+        self.staging = torch.empty(padded, dtype=torch.uint8, device=device)
         self.zero = torch.empty(padded, dtype=torch.uint8, device=device)
         self.zero_count = torch.zeros(1, dtype=torch.int32, device=device)
-        self.retained_count = torch.zeros(1, dtype=torch.int32, device=device)
         self.result = torch.empty(data.numel, dtype=torch.bfloat16, device=device)
 
     def compress(self):
         d = self.data
-        zzip.compress_split_store_pad(d.input, d.n_8, d.orig_n_8, d.bases, self.threshold,
-                                      self.compressed, self.staging, self.retained, self.zero,
-                                      self.zero_count, self.retained_count, d.padded, 1)
+        zzip.hopper_compress(d.input, d.n_8, d.orig_n_8, self.bases,
+                             self.compressed, self.staging, self.zero,
+                             self.zero_count, self.threshold, d.padded, 1)
 
     def decompress(self):
         d = self.data
-        zzip.decompress_split_store_unpad(self.compressed, self.retained, self.zero, d.n_8,
-                                          self.retained_count, self.zero_count, self.result,
-                                          d.numel, 1)
+        zzip.hopper_decompress(self.compressed, self.zero, d.n_8,
+                               self.zero_count, self.result, d.numel, 1)
 
     def output(self):
         return self.result
 
-    def compression_stats(self):
-        return f"retained bytes: {int(self.retained_count.item())}, zero bytes: {int(self.zero_count.item())}"
+    def outlier_count(self):
+        return int(self.zero_count.item())
 
 
 class ZipCCLBenchmark(KernelBenchmark):
@@ -120,6 +161,7 @@ class ZipCCLBenchmark(KernelBenchmark):
         super().__init__(data)
         padded, blocks, device = data.padded, data.padded // ELEMS_PER_BLOCK, data.device
         det_bytes = align(padded + padded // 8 * 3 + blocks * 4 + 4)
+        self.bases = estimate_base(data.input[:data.numel], 121.65)
         self.compressed = torch.empty(det_bytes, dtype=torch.uint8, device=device)
         self.zero_tmp = torch.empty(padded, dtype=torch.uint8, device=device)
         self.zero = torch.empty(padded, dtype=torch.uint8, device=device)
@@ -129,7 +171,7 @@ class ZipCCLBenchmark(KernelBenchmark):
     def compress(self):
         d = self.data
         self.zero_count.zero_()
-        hopper_fastzip2.compress_split_store_pad(d.input, d.n_8, d.orig_n_8, d.bases,
+        hopper_fastzip2.compress_split_store_pad(d.input, d.n_8, d.orig_n_8, self.bases,
                                                  self.compressed, self.zero_tmp, self.zero,
                                                  self.zero_count, d.padded, 1)
 
@@ -141,18 +183,25 @@ class ZipCCLBenchmark(KernelBenchmark):
     def output(self):
         return self.result
 
-    def compression_stats(self):
-        return f"zero bytes: {int(self.zero_count.item())}"
+    def outlier_count(self):
+        return int(self.zero_count.item())
+
+
+def format_bytes(value):
+    if value < 1024:
+        return f"{value} B"
+    if value < 1024**2:
+        return f"{value / 1024:.2f} KiB"
+    return f"{value / 1024**2:.2f} MiB"
 
 
 def make_input(numel, device):
     padded = (numel + ELEMS_PER_BLOCK - 1) // ELEMS_PER_BLOCK * ELEMS_PER_BLOCK
     values = torch.zeros(padded, dtype=torch.bfloat16, device=device)
-    values[:numel].normal_()
+    values[:numel].normal_(mean=0, std=1e-5)
     return BenchmarkInput(numel, padded, device, values,
                           torch.tensor([padded], dtype=torch.int32, device=device),
-                          torch.tensor([numel], dtype=torch.int32, device=device),
-                          torch.tensor([124], dtype=torch.int32, device=device))
+                          torch.tensor([numel], dtype=torch.int32, device=device))
 
 
 def main():
@@ -163,6 +212,10 @@ def main():
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+    if args.numel <= 0:
+        parser.error("--numel must be positive")
+    if args.warmup < 0 or args.iters <= 0 or args.repeats <= 0:
+        parser.error("--warmup must be non-negative; --iters and --repeats must be positive")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable")
     device = torch.device(args.device)
@@ -173,9 +226,26 @@ def main():
     print(f"elements: {args.numel} (padded: {data.padded})")
     for benchmark in (ZZipCCLBenchmark(data), ZipCCLBenchmark(data)):
         comp, decomp, error = benchmark.run(args.warmup, args.iters, args.repeats)
-        print(f"{benchmark.name}: {benchmark.compression_stats()}, max abs error: {error:.6g}")
+        comm = benchmark.communication_stats()
+        print(
+            f"{benchmark.name}: base {int(benchmark.bases.item())}, "
+            f"max abs error: {error:.6g}"
+        )
         print(f"  compress:   median {comp[0]:.4f} ms, mean {comp[1]:.4f} ms")
         print(f"  decompress: median {decomp[0]:.4f} ms, mean {decomp[1]:.4f} ms")
+        print(
+            "  communication: "
+            f"original {format_bytes(comm.original_bytes)}, "
+            f"deterministic {format_bytes(comm.deterministic_bytes)}, "
+            f"outliers {format_bytes(comm.outlier_bytes)} "
+            f"(aligned {format_bytes(comm.aligned_outlier_bytes)}), "
+            f"metadata {format_bytes(comm.metadata_bytes)}"
+        )
+        print(
+            f"  total: payload {format_bytes(comm.payload_bytes)}, "
+            f"wire {format_bytes(comm.wire_bytes)}, "
+            f"compression ratio {comm.compression_ratio:.3f}x"
+        )
 
 
 if __name__ == "__main__":
