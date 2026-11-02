@@ -232,8 +232,8 @@ class ZipCCLReduceScatter:
             or input_tensor.numel() == 0
             or input_tensor.numel() < self.min_compress_numel
             or input_tensor.numel() != output_tensor.numel() * world_size
-            or not input_tensor.is_floating_point()
-            or not output_tensor.is_floating_point()
+            or not input_tensor.dtype == torch.bfloat16
+            or not output_tensor.dtype == torch.bfloat16
             or not input_tensor.is_cuda
             or not output_tensor.is_cuda
             or not self._supported_op(op)
@@ -263,7 +263,7 @@ class ZipCCLReduceScatter:
         )
         det_split_sizes = [det_bytes] * world_size
 
-        input_bf16 = input_tensor.contiguous().view(-1).to(torch.bfloat16)
+        input = input_tensor.contiguous().view(-1)
         n_8 = torch.full(
             (world_size,),
             padded_shard_numel,
@@ -274,7 +274,7 @@ class ZipCCLReduceScatter:
             (world_size,), shard_numel, dtype=torch.int32, device=device
         )
 
-        std = input_bf16.std(unbiased=False).float()
+        std = input.std(unbiased=False).float()
         std = torch.nan_to_num(std, nan=1e-30, posinf=1e30, neginf=1e-30)
         best_i = torch.round(torch.log2(torch.clamp(std, min=1e-30)) + 121.65)
         bases_in = torch.clamp(best_i, 0, 249).to(torch.int32).reshape(1)
@@ -293,7 +293,7 @@ class ZipCCLReduceScatter:
         zero_send = torch.empty_like(zero_tmp)
 
         hopper_fastzip2.compress_split_store_pad(
-            input_bf16,
+            input,
             n_8,
             orig_n_8,
             bases_in,
@@ -361,14 +361,14 @@ class ZipCCLReduceScatter:
 
         source_shards = decompressed.view(world_size, shard_numel)
         if op == dist.ReduceOp.AVG:
-            reduced = source_shards.float().mean(dim=0)
+            reduced = source_shards.mean(dim=0, dtype=torch.float)
         else:
-            reduced = source_shards.float().sum(dim=0)
+            reduced = source_shards.sum(dim=0, dtype=torch.float)
         output_tensor.copy_(reduced.view(output_tensor.shape))
 
         stream = torch.cuda.current_stream(device)
         for tensor in (
-            input_bf16,
+            input,
             n_8,
             orig_n_8,
             bases_in,

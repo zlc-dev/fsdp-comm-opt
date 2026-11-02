@@ -56,11 +56,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--std", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--zero-threshold", type=float, default=1e-6)
-    parser.add_argument(
-        "--dtype",
-        choices=("float32", "bfloat16"),
-        default="float32",
-    )
     parser.add_argument("--native-atol", type=float, default=1e-5)
     parser.add_argument("--native-rtol", type=float, default=1e-5)
     parser.add_argument("--compressed-atol", type=float, default=5e-2)
@@ -94,6 +89,25 @@ def native_reduce_scatter(
     )
 
 
+def native_all_to_all_reduce(
+    output: torch.Tensor,
+    input_tensor: torch.Tensor,
+    group: dist.ProcessGroup,
+) -> None:
+    """Exchange destination shards without compression, then reduce locally."""
+    world_size = dist.get_world_size(group)
+    shard_numel = output.numel()
+    received = torch.empty_like(input_tensor)
+    dist.all_to_all_single(received, input_tensor, group=group)
+
+    # all_to_all_single returns one shard from each source rank, ordered by
+    # source. Match the compressed implementations by accumulating locally in
+    # FP32 before converting to the requested output dtype.
+    source_shards = received.view(world_size, shard_numel)
+    reduced = source_shards.sum(dim=0, dtype=torch.float32)
+    output.copy_(reduced.view(output.shape))
+
+
 def generate_input(
     numel: int,
     dtype: torch.dtype,
@@ -119,7 +133,7 @@ def reference_from_all_gather(
     shard_numel: int,
     group: dist.ProcessGroup,
 ) -> torch.Tensor:
-    """Gather every rank's complete input and form this rank's FP32 result."""
+    """Form this rank's BF16 result using FP32 accumulation."""
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
     gathered = torch.empty(
@@ -129,7 +143,9 @@ def reference_from_all_gather(
     )
     dist.all_gather_into_tensor(gathered, input_tensor, group=group)
     source_destination = gathered.view(world_size, world_size, shard_numel)
-    expected = source_destination[:, rank, :].float().sum(dim=0)
+    expected = source_destination[:, rank, :].sum(
+        dim=0, dtype=torch.float32
+    ).to(torch.bfloat16)
     del gathered, source_destination
     return expected
 
@@ -143,9 +159,9 @@ def global_accuracy(
 ) -> Accuracy:
     diff = actual.float() - expected
     max_abs = diff.abs().max()
-    abs_sum = diff.abs().sum(dtype=torch.float64)
-    square_sum = diff.double().square().sum()
-    reference_square_sum = expected.double().square().sum()
+    abs_sum = diff.abs().sum(dtype=torch.float32)
+    square_sum = diff.float().square().sum()
+    reference_square_sum = expected.float().square().sum()
     passed = torch.tensor(
         int(torch.allclose(actual.float(), expected, atol=atol, rtol=rtol)),
         dtype=torch.int32,
@@ -218,7 +234,7 @@ def benchmark_method(
 
         # Collective latency is determined by the slowest participating rank.
         elapsed_tensor = torch.tensor(
-            elapsed, dtype=torch.float64, device=input_tensor.device
+            elapsed, dtype=torch.float32, device=input_tensor.device
         )
         dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX, group=group)
         timings_ms.append(elapsed_tensor.item() * 1000.0 / iters)
@@ -233,7 +249,7 @@ def print_configuration(
     input_mib = input_tensor.numel() * input_tensor.element_size() / 2**20
     gathered_mib = input_mib * world_size
     print(
-        f"world_size={world_size} dtype={args.dtype} "
+        f"world_size={world_size} "
         f"shard_numel={args.shard_numel:,} input_per_rank={input_mib:.2f} MiB "
         f"all_gather_buffer_per_rank={gathered_mib:.2f} MiB"
     )
@@ -263,7 +279,7 @@ def run(args: argparse.Namespace) -> bool:
             "this benchmark requires at least two visible GPUs; with one rank "
             "ZipCCL and ZZipCCL fall back to native reduce-scatter"
         )
-    dtype = torch.float32 if args.dtype == "float32" else torch.bfloat16
+    dtype = torch.bfloat16
 
     try:
         from main.zipccl_comm import ZipCCLReduceScatter
@@ -293,18 +309,19 @@ def run(args: argparse.Namespace) -> bool:
     torch.cuda.empty_cache()
 
     zipccl = ZipCCLReduceScatter()
-    zzipccl_ef = ZZipCCLReduceScatter(
+    zzipccl = ZZipCCLReduceScatter(
         zero_threshold=args.zero_threshold,
-        local_error_feedback=True,
-    )
-    zzipccl_no_ef = ZZipCCLReduceScatter(
-        zero_threshold=args.zero_threshold,
-        local_error_feedback=False,
     )
     methods = (
         Method(
             "Native",
             native_reduce_scatter,
+            args.native_atol,
+            args.native_rtol,
+        ),
+        Method(
+            "All2All+Reduce",
+            native_all_to_all_reduce,
             args.native_atol,
             args.native_rtol,
         ),
@@ -315,15 +332,8 @@ def run(args: argparse.Namespace) -> bool:
             args.compressed_rtol,
         ),
         Method(
-            "ZZipCCL-EF",
-            zzipccl_ef,
-            args.compressed_atol,
-            args.compressed_rtol,
-            zzipccl_ef.reset_error_feedback,
-        ),
-        Method(
-            "ZZipCCL-NoEF",
-            zzipccl_no_ef,
+            "ZZipCCL",
+            zzipccl,
             args.compressed_atol,
             args.compressed_rtol,
         ),
