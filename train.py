@@ -38,6 +38,7 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEm
 
 from main.zipccl_comm import ZipCCLAllGather, ZipCCLReduceScatter
 from main.zzipccl_comm import ZZipCCLAllGather, ZZipCCLReduceScatter
+from main.zzipccl_ef_comm import ZZipCCLEfReduceScatter
 
 def reset_rope(self: LlamaRotaryEmbedding):
     rope_init_fn = getattr(self, "rope_init_fn", None)
@@ -73,12 +74,12 @@ def set_custom_all_gather(m: FSDPModule, args: argparse.Namespace):
         m.set_custom_reduce_scatter(
             ZZipCCLReduceScatter(zero_threshold=1e-6)
         )
-    elif args.quantize_name == "zzipccl2":
+    elif args.quantize_name == "zzipccl-ef":
         # m.set_custom_all_gather(
-        #     ZZipCCLAllGather(reuse=True, zero_threshold=1e-3)
+        #     ZZipCCLAllGather(zero_threshold=1e-3)
         # )
         m.set_custom_reduce_scatter(
-            ZZipCCLReduceScatter(reuse=True, zero_threshold=1e-6)
+            ZZipCCLEfReduceScatter(zero_threshold=1e-6)
         )
     else:
         # m.set_custom_all_gather(ZipCCLAllGather())
