@@ -5,7 +5,11 @@ import torch.distributed as dist
 
 from zzipccl import zzip
 
+from main.zzipccl_window import adaptive_window_base_tensor
+
 _ELEMS_PER_BLOCK = 128 * 32
+_EXPONENT_BIAS = 127
+_WINDOW_SIZE = 6
 
 
 def _align(value: int, alignment: int = 128) -> int:
@@ -141,7 +145,14 @@ class ZZipCCLEfReduceScatter:
 
         std = compensated_input.std(unbiased=False).float()
         std = torch.nan_to_num(std, nan=1e-30, posinf=1e30, neginf=1e-30)
-        best_i = torch.round(torch.log2(torch.clamp(std, min=1e-30)) + 122.52827)
+        std = torch.clamp(std, min=1e-30)
+        best_i = torch.round(torch.log2(std) + 122.52827)
+        best_i = adaptive_window_base_tensor(
+            std,
+            self.zero_threshold,
+            best_i - _EXPONENT_BIAS,
+            _WINDOW_SIZE,
+        ) + _EXPONENT_BIAS
         bases_in = torch.clamp(best_i, 0, 249).to(torch.int32).reshape(1)
 
         zero_counts_send = torch.zeros(

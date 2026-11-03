@@ -563,7 +563,7 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("-q", "--quantize", default=False, action="store_true")
     parser.add_argument(
         "--quantize-name",
-        choices=("zipccl", "zzipccl", "zzipccl2"),
+        choices=("zipccl", "zzipccl", "zzipccl-ef"),
         default=None,
     )
     parser.add_argument(
