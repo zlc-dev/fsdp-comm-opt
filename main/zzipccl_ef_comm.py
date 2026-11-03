@@ -17,12 +17,12 @@ def _align(value: int, alignment: int = 128) -> int:
 
 
 class ZZipCCLEfReduceScatter:
-    """ZZipCCL reduce-scatter with sender-side error feedback.
+    """ZZipCCL reduce-scatter with one-shard sender error feedback.
 
-    The residual is kept in BF16 and has the same number of elements as the
-    local reduce-scatter input.  Before compression, the previous residual is
-    added to the new input.  Compression then replaces that buffer in-place
-    with the error introduced by the lossy code-7 near-zero representation.
+    Each rank retains BF16 compression errors only for the destination shard
+    whose index equals that rank. This bounds persistent residual storage to
+    ``1 / world_size`` of the local reduce-scatter input; errors for the other
+    destination shards are intentionally not fed back.
     """
 
     def __init__(
@@ -52,21 +52,21 @@ class ZZipCCLEfReduceScatter:
 
     def _get_residual(
         self,
-        input_tensor: torch.Tensor,
+        shard_tensor: torch.Tensor,
         world_size: int,
     ) -> torch.Tensor:
         residual = self._residual
         if (
             residual is None
-            or residual.numel() != input_tensor.numel()
-            or residual.device != input_tensor.device
-            or residual.dtype != input_tensor.dtype
+            or residual.numel() != shard_tensor.numel()
+            or residual.device != shard_tensor.device
+            or residual.dtype != shard_tensor.dtype
             or self._residual_world_size != world_size
         ):
             residual = torch.zeros(
-                input_tensor.numel(),
-                dtype=input_tensor.dtype,
-                device=input_tensor.device,
+                shard_tensor.numel(),
+                dtype=shard_tensor.dtype,
+                device=shard_tensor.device,
             )
             self._residual = residual
             self._residual_world_size = world_size
@@ -110,6 +110,7 @@ class ZZipCCLEfReduceScatter:
             )
 
         device = input_tensor.device
+        rank = dist.get_rank(group)
         shard_numel = output_tensor.numel()
         padded_shard_numel = _align(shard_numel, _ELEMS_PER_BLOCK)
         padded_total_numel = padded_shard_numel * world_size
@@ -126,13 +127,7 @@ class ZZipCCLEfReduceScatter:
         det_split_sizes = [det_bytes] * world_size
 
         input = input_tensor.contiguous().view(-1)
-        residual = self._get_residual(input_tensor, world_size)
-        # Reuse the persistent residual allocation as the compensated input.
-        # The compression kernel overwrites it with the next residual after
-        # loading the compensated values into registers.
-        with torch.no_grad():
-            residual.add_(input)
-        compensated_input = residual
+        residual = self._get_residual(output_tensor, world_size)
         n_8 = torch.full(
             (world_size,),
             padded_shard_numel,
@@ -143,7 +138,10 @@ class ZZipCCLEfReduceScatter:
             (world_size,), shard_numel, dtype=torch.int32, device=device
         )
 
-        std = compensated_input.std(unbiased=False).float()
+        # The retained residual contains only code-7 near-zero values for one
+        # shard, so using the uncompensated input for window selection avoids
+        # materializing a full compensated tensor.
+        std = input.std(unbiased=False).float()
         std = torch.nan_to_num(std, nan=1e-30, posinf=1e30, neginf=1e-30)
         std = torch.clamp(std, min=1e-30)
         best_i = torch.round(torch.log2(std) + 122.52827)
@@ -172,7 +170,7 @@ class ZZipCCLEfReduceScatter:
         zero_send = torch.empty_like(zero_staging)
 
         self._compress(
-            compensated_input,
+            input,
             n_8,
             orig_n_8,
             bases_in,
@@ -184,10 +182,12 @@ class ZZipCCLEfReduceScatter:
             padded_total_numel,
             world_size,
             write_residual=True,
+            residual=residual,
+            residual_work=rank,
         )
 
-        # The compression kernel has already written the next residual back to
-        # compensated_input, so only the received streams need decompression.
+        # The compression kernel has updated this rank's one-shard residual;
+        # only received compressed streams still require decompression.
         count_work = dist.all_to_all_single(
             zero_counts_recv,
             zero_counts_send,

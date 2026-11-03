@@ -104,7 +104,8 @@ __global__ void hopper_copy_zero_kernel(
 
 template <bool REUSE_CODE7_SLOTS, bool WRITE_RESIDUAL>
 __global__ void hopper_compress_split_store_pad_kernel(
-    rptr<__nv_bfloat16> input,
+    const rptr<__nv_bfloat16> input,
+    rptr<__nv_bfloat16> residual,
     rptr<unsigned char> output,
     rptr<unsigned char> output1,
     rptr<int> n_8,
@@ -112,6 +113,7 @@ __global__ void hopper_compress_split_store_pad_kernel(
     rptr<int> global_zero_counter_8,
     rptr<int> bases_in,
     rptr<float> zero_threshold,
+    int residual_work,
     int n_works)
 {
     extern __shared__ __align__(128) uint8_t reuse_smem[];
@@ -190,6 +192,20 @@ __global__ void hopper_compress_split_store_pad_kernel(
                 reg_in[off + j] = (idx < my_orig)
                     ? input[my_input_off + (size_t)idx]
                     : __ushort_as_bfloat16(0);
+            }
+        }
+    }
+
+    if constexpr (WRITE_RESIDUAL) {
+        if (my_i == residual_work) {
+            #pragma unroll
+            for (int j = 0; j < PACK; ++j) {
+                int elem_in_work = base_in_work + j;
+                if (elem_in_work < my_orig) {
+                    reg_in[j] = __float2bfloat16_rn(
+                        __bfloat162float(reg_in[j])
+                        + __bfloat162float(residual[elem_in_work]));
+                }
             }
         }
     }
@@ -331,29 +347,31 @@ __global__ void hopper_compress_split_store_pad_kernel(
 
     if constexpr (WRITE_RESIDUAL) {
         // Codes 0-6 are reconstructed bit-exactly. Code 7 is the only lossy
-        // case: the decoder replaces the original near-zero value with zero.
-        // All input values are already resident in reg_in, so the dense input
-        // buffer can now be reused for the next error-feedback residual.
-        uint32_t seven_mask = b0 & b1 & b2;
-        int elem_in_work = my_real_n_block * ELEMS_PER_BLOCK + tid * PACK;
-        if (elem_in_work < my_orig) {
-            int valid = min(PACK, my_orig - elem_in_work);
-            __nv_bfloat16* residual = input + my_input_off + elem_in_work;
-            #pragma unroll
-            for (int j = 0; j < PACK; ++j) {
-                if (((seven_mask >> j) & 1u) == 0) {
-                    reg_in[j] = __ushort_as_bfloat16(0);
-                }
-            }
-            if (aligned && valid == PACK) {
+        // case. Retain errors for only one destination shard so persistent
+        // residual storage is 1 / n_works of the dense input.
+        if (my_i == residual_work) {
+            uint32_t seven_mask = b0 & b1 & b2;
+            int elem_in_work =
+                my_real_n_block * ELEMS_PER_BLOCK + tid * PACK;
+            if (elem_in_work < my_orig) {
+                int valid = min(PACK, my_orig - elem_in_work);
                 #pragma unroll
-                for (int off = 0; off < PACK; off += 8) {
-                    *reinterpret_cast<float4*>(residual + off) =
-                        *reinterpret_cast<float4*>(reg_in + off);
+                for (int j = 0; j < PACK; ++j) {
+                    if (((seven_mask >> j) & 1u) == 0) {
+                        reg_in[j] = __ushort_as_bfloat16(0);
+                    }
                 }
-            } else {
-                for (int j = 0; j < valid; ++j) {
-                    residual[j] = reg_in[j];
+                if (valid == PACK) {
+                    #pragma unroll
+                    for (int off = 0; off < PACK; off += 8) {
+                        *reinterpret_cast<float4*>(
+                            residual + elem_in_work + off) =
+                            *reinterpret_cast<float4*>(reg_in + off);
+                    }
+                } else {
+                    for (int j = 0; j < valid; ++j) {
+                        residual[elem_in_work + j] = reg_in[j];
+                    }
                 }
             }
         }
@@ -578,11 +596,11 @@ __global__ void hopper_decompress_split_store_unpad_kernel(
 
 
 void hopper_compress_split_store_pad_api_8(
-    __nv_bfloat16* input, unsigned char* output,
+    __nv_bfloat16* input, __nv_bfloat16* residual, unsigned char* output,
     unsigned char* staging, unsigned char* zero_output,
     int* n_8, int* orig_n_8, int* zero_count_8, int* bases_in,
     float* zero_threshold,
-    int padded_n_total, int n_works, bool write_residual)
+    int padded_n_total, int residual_work, int n_works, bool write_residual)
 {
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     int blocks = padded_n_total / ELEMS_PER_BLOCK;
@@ -592,13 +610,13 @@ void hopper_compress_split_store_pad_api_8(
     if (write_residual) {
         hopper_compress_split_store_pad_kernel<false, true><<<
             blocks, BLOCK_SIZE, 0, stream>>>(
-            input, output, staging, n_8, orig_n_8, zero_count_8,
-            bases_in, zero_threshold, n_works);
+            input, residual, output, staging, n_8, orig_n_8, zero_count_8,
+            bases_in, zero_threshold, residual_work, n_works);
     } else {
         hopper_compress_split_store_pad_kernel<false, false><<<
             blocks, BLOCK_SIZE, 0, stream>>>(
-            input, output, staging, n_8, orig_n_8, zero_count_8,
-            bases_in, zero_threshold, n_works);
+            input, residual, output, staging, n_8, orig_n_8, zero_count_8,
+            bases_in, zero_threshold, residual_work, n_works);
     }
 
     size_t smem = COPY_CHUNK;
@@ -626,11 +644,11 @@ void hopper_decompress_split_store_unpad_api_8(
 }
 
 void hopper2_compress_split_store_pad_api_8(
-    __nv_bfloat16* input, unsigned char* output,
+    __nv_bfloat16* input, __nv_bfloat16* residual, unsigned char* output,
     unsigned char* staging, unsigned char* zero_output,
     int* n_8, int* orig_n_8, int* zero_count_8, int* bases_in,
     float* zero_threshold,
-    int padded_n_total, int n_works, bool write_residual)
+    int padded_n_total, int residual_work, int n_works, bool write_residual)
 {
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     int blocks = padded_n_total / ELEMS_PER_BLOCK;
@@ -641,13 +659,13 @@ void hopper2_compress_split_store_pad_api_8(
     if (write_residual) {
         hopper_compress_split_store_pad_kernel<true, true><<<
             blocks, BLOCK_SIZE, reuse_smem, stream>>>(
-            input, output, staging, n_8, orig_n_8, zero_count_8,
-            bases_in, zero_threshold, n_works);
+            input, residual, output, staging, n_8, orig_n_8, zero_count_8,
+            bases_in, zero_threshold, residual_work, n_works);
     } else {
         hopper_compress_split_store_pad_kernel<true, false><<<
             blocks, BLOCK_SIZE, reuse_smem, stream>>>(
-            input, output, staging, n_8, orig_n_8, zero_count_8,
-            bases_in, zero_threshold, n_works);
+            input, residual, output, staging, n_8, orig_n_8, zero_count_8,
+            bases_in, zero_threshold, residual_work, n_works);
     }
 
     size_t smem = COPY_CHUNK;

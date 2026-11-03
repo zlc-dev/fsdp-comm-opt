@@ -1,5 +1,6 @@
 """Type declarations for the ``zzip`` CUDA extension."""
 
+from typing import Optional
 import torch
 
 def hopper_compress(
@@ -15,6 +16,8 @@ def hopper_compress(
     padded_n_total: int,
     n_works: int,
     write_residual: bool = False,
+    residual: Optional[torch.Tensor] = None,
+    residual_work: int = -1,
 ) -> None:
     """Run Hopper split-store compression with in-kernel input padding.
 
@@ -22,7 +25,8 @@ def hopper_compress(
     count. ``staging`` and ``zero_output`` each need at least
     ``padded_n_total`` bytes. ``zero_threshold`` is a scalar CUDA float32
     tensor containing the code-7 near-zero cutoff. If ``write_residual`` is
-    true, ``input`` is replaced in-place by the code-7 compression residual.
+    true, ``residual`` is added to work ``residual_work`` before compression
+    and then replaced in-place by that work's code-7 compression residual.
     """
     ...
 
@@ -53,13 +57,16 @@ def hopper2_compress(
     padded_n_total: int,
     n_works: int,
     write_residual: bool = False,
+    residual: Optional[torch.Tensor] = None,
+    residual_work: int = -1,
 ) -> None:
     """Run Hopper2 compression with warp-local code-7 slot reuse.
 
     ``zero_count_8`` contains only code-0 exponents that could not be paired
     with a code-7 slot in the same warp. The resulting streams must be
     decoded with ``hopper2_decompress``. If ``write_residual`` is true,
-    ``input`` is replaced in-place by the code-7 compression residual.
+    ``residual`` is added to work ``residual_work`` before compression and
+    then replaced in-place by that work's code-7 compression residual.
     """
     ...
 

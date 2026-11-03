@@ -6,6 +6,7 @@
 
 void hopper_compress_split_store_pad_api_8(
     __nv_bfloat16* input,
+    __nv_bfloat16* residual,
     unsigned char* output,
     unsigned char* staging,
     unsigned char* zero_output,
@@ -15,6 +16,7 @@ void hopper_compress_split_store_pad_api_8(
     int* bases_in,
     float* zero_threshold,
     int padded_n_total,
+    int residual_work,
     int n_works,
     bool write_residual);
 
@@ -30,6 +32,7 @@ void hopper_decompress_split_store_unpad_api_8(
 
 void hopper2_compress_split_store_pad_api_8(
     __nv_bfloat16* input,
+    __nv_bfloat16* residual,
     unsigned char* output,
     unsigned char* staging,
     unsigned char* zero_output,
@@ -39,6 +42,7 @@ void hopper2_compress_split_store_pad_api_8(
     int* bases_in,
     float* zero_threshold,
     int padded_n_total,
+    int residual_work,
     int n_works,
     bool write_residual);
 
@@ -115,7 +119,9 @@ void hopper_compress(
     torch::Tensor zero_threshold,
     int padded_n_total,
     int n_works,
-    bool write_residual)
+    bool write_residual,
+    torch::Tensor residual,
+    int residual_work)
 {
     check_tensor(input, "input", torch::kBFloat16);
     check_tensor(n_8, "n_8", torch::kInt32);
@@ -153,8 +159,23 @@ void hopper_compress(
     check_same_device(zero_count_8, input, "zero_count_8");
     check_same_device(zero_threshold, input, "zero_threshold");
 
+    __nv_bfloat16* residual_ptr = nullptr;
+    if (write_residual) {
+        check_tensor(residual, "residual", torch::kBFloat16);
+        check_same_device(residual, input, "residual");
+        TORCH_CHECK(
+            residual_work >= 0 && residual_work < n_works,
+            "residual_work must be in [0, n_works)");
+        TORCH_CHECK(
+            residual.numel() * static_cast<int64_t>(n_works) == input.numel(),
+            "residual must contain exactly one input shard");
+        residual_ptr = reinterpret_cast<__nv_bfloat16*>(
+            residual.data_ptr<torch::BFloat16>());
+    }
+
     hopper_compress_split_store_pad_api_8(
         reinterpret_cast<__nv_bfloat16*>(input.data_ptr<torch::BFloat16>()),
+        residual_ptr,
         compressed_output.data_ptr<unsigned char>(),
         staging.data_ptr<unsigned char>(),
         zero_output.data_ptr<unsigned char>(),
@@ -164,6 +185,7 @@ void hopper_compress(
         bases_in.data_ptr<int>(),
         zero_threshold.data_ptr<float>(),
         padded_n_total,
+        residual_work,
         n_works,
         write_residual);
 }
@@ -225,7 +247,9 @@ void hopper2_compress(
     torch::Tensor zero_threshold,
     int padded_n_total,
     int n_works,
-    bool write_residual)
+    bool write_residual,
+    torch::Tensor residual,
+    int residual_work)
 {
     check_tensor(input, "input", torch::kBFloat16);
     check_tensor(n_8, "n_8", torch::kInt32);
@@ -263,8 +287,23 @@ void hopper2_compress(
     check_same_device(zero_count_8, input, "zero_count_8");
     check_same_device(zero_threshold, input, "zero_threshold");
 
+    __nv_bfloat16* residual_ptr = nullptr;
+    if (write_residual) {
+        check_tensor(residual, "residual", torch::kBFloat16);
+        check_same_device(residual, input, "residual");
+        TORCH_CHECK(
+            residual_work >= 0 && residual_work < n_works,
+            "residual_work must be in [0, n_works)");
+        TORCH_CHECK(
+            residual.numel() * static_cast<int64_t>(n_works) == input.numel(),
+            "residual must contain exactly one input shard");
+        residual_ptr = reinterpret_cast<__nv_bfloat16*>(
+            residual.data_ptr<torch::BFloat16>());
+    }
+
     hopper2_compress_split_store_pad_api_8(
         reinterpret_cast<__nv_bfloat16*>(input.data_ptr<torch::BFloat16>()),
+        residual_ptr,
         compressed_output.data_ptr<unsigned char>(),
         staging.data_ptr<unsigned char>(),
         zero_output.data_ptr<unsigned char>(),
@@ -274,6 +313,7 @@ void hopper2_compress(
         bases_in.data_ptr<int>(),
         zero_threshold.data_ptr<float>(),
         padded_n_total,
+        residual_work,
         n_works,
         write_residual);
 }
@@ -339,7 +379,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         py::arg("zero_threshold"),
         py::arg("padded_n_total"),
         py::arg("n_works"),
-        py::arg("write_residual") = false);
+        py::arg("write_residual") = false,
+        py::arg("residual") = torch::Tensor(),
+        py::arg("residual_work") = -1);
     module.def(
         "hopper_decompress",
         &hopper_decompress,
@@ -359,7 +401,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         py::arg("zero_threshold"),
         py::arg("padded_n_total"),
         py::arg("n_works"),
-        py::arg("write_residual") = false);
+        py::arg("write_residual") = false,
+        py::arg("residual") = torch::Tensor(),
+        py::arg("residual_work") = -1);
     module.def(
         "hopper2_decompress",
         &hopper2_decompress,
