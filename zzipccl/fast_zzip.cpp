@@ -15,7 +15,8 @@ void hopper_compress_split_store_pad_api_8(
     int* bases_in,
     float* zero_threshold,
     int padded_n_total,
-    int n_works);
+    int n_works,
+    bool write_residual);
 
 void hopper_decompress_split_store_unpad_api_8(
     unsigned char* compressed_input,
@@ -38,7 +39,8 @@ void hopper2_compress_split_store_pad_api_8(
     int* bases_in,
     float* zero_threshold,
     int padded_n_total,
-    int n_works);
+    int n_works,
+    bool write_residual);
 
 void hopper2_decompress_split_store_unpad_api_8(
     unsigned char* compressed_input,
@@ -112,7 +114,8 @@ void hopper_compress(
     torch::Tensor zero_count_8,
     torch::Tensor zero_threshold,
     int padded_n_total,
-    int n_works)
+    int n_works,
+    bool write_residual)
 {
     check_tensor(input, "input", torch::kBFloat16);
     check_tensor(n_8, "n_8", torch::kInt32);
@@ -161,7 +164,8 @@ void hopper_compress(
         bases_in.data_ptr<int>(),
         zero_threshold.data_ptr<float>(),
         padded_n_total,
-        n_works);
+        n_works,
+        write_residual);
 }
 
 void hopper_decompress(
@@ -220,7 +224,8 @@ void hopper2_compress(
     torch::Tensor zero_count_8,
     torch::Tensor zero_threshold,
     int padded_n_total,
-    int n_works)
+    int n_works,
+    bool write_residual)
 {
     check_tensor(input, "input", torch::kBFloat16);
     check_tensor(n_8, "n_8", torch::kInt32);
@@ -269,7 +274,8 @@ void hopper2_compress(
         bases_in.data_ptr<int>(),
         zero_threshold.data_ptr<float>(),
         padded_n_total,
-        n_works);
+        n_works,
+        write_residual);
 }
 
 void hopper2_decompress(
@@ -321,7 +327,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def(
         "hopper_compress",
         &hopper_compress,
-        "Hopper split-store compression with in-kernel padding");
+        "Hopper split-store compression with in-kernel padding",
+        py::arg("input"),
+        py::arg("n_8"),
+        py::arg("orig_n_8"),
+        py::arg("bases_in"),
+        py::arg("compressed_output"),
+        py::arg("staging"),
+        py::arg("zero_output"),
+        py::arg("zero_count_8"),
+        py::arg("zero_threshold"),
+        py::arg("padded_n_total"),
+        py::arg("n_works"),
+        py::arg("write_residual") = false);
     module.def(
         "hopper_decompress",
         &hopper_decompress,
@@ -329,7 +347,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def(
         "hopper2_compress",
         &hopper2_compress,
-        "Hopper2 split-store compression with warp-local slot reuse");
+        "Hopper2 split-store compression with warp-local slot reuse",
+        py::arg("input"),
+        py::arg("n_8"),
+        py::arg("orig_n_8"),
+        py::arg("bases_in"),
+        py::arg("compressed_output"),
+        py::arg("staging"),
+        py::arg("zero_output"),
+        py::arg("zero_count_8"),
+        py::arg("zero_threshold"),
+        py::arg("padded_n_total"),
+        py::arg("n_works"),
+        py::arg("write_residual") = false);
     module.def(
         "hopper2_decompress",
         &hopper2_decompress,

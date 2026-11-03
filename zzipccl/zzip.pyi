@@ -14,13 +14,15 @@ def hopper_compress(
     zero_threshold: torch.Tensor,
     padded_n_total: int,
     n_works: int,
+    write_residual: bool = False,
 ) -> None:
     """Run Hopper split-store compression with in-kernel input padding.
 
     ``zero_count_8`` is reset and then overwritten with each work's outlier
     count. ``staging`` and ``zero_output`` each need at least
     ``padded_n_total`` bytes. ``zero_threshold`` is a scalar CUDA float32
-    tensor containing the code-7 near-zero cutoff.
+    tensor containing the code-7 near-zero cutoff. If ``write_residual`` is
+    true, ``input`` is replaced in-place by the code-7 compression residual.
     """
     ...
 
@@ -50,12 +52,14 @@ def hopper2_compress(
     zero_threshold: torch.Tensor,
     padded_n_total: int,
     n_works: int,
+    write_residual: bool = False,
 ) -> None:
     """Run Hopper2 compression with warp-local code-7 slot reuse.
 
     ``zero_count_8`` contains only code-0 exponents that could not be paired
     with a code-7 slot in the same warp. The resulting streams must be
-    decoded with ``hopper2_decompress``.
+    decoded with ``hopper2_decompress``. If ``write_residual`` is true,
+    ``input`` is replaced in-place by the code-7 compression residual.
     """
     ...
 

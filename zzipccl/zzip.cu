@@ -102,9 +102,9 @@ __global__ void hopper_copy_zero_kernel(
     }
 }
 
-template <bool REUSE_CODE7_SLOTS>
+template <bool REUSE_CODE7_SLOTS, bool WRITE_RESIDUAL>
 __global__ void hopper_compress_split_store_pad_kernel(
-    const rptr<__nv_bfloat16> input,
+    rptr<__nv_bfloat16> input,
     rptr<unsigned char> output,
     rptr<unsigned char> output1,
     rptr<int> n_8,
@@ -327,6 +327,36 @@ __global__ void hopper_compress_split_store_pad_kernel(
         int bit = __ffs(m) - 1;
         non_compress_exp[pos++] = exp_local[bit];
         m &= (m - 1);
+    }
+
+    if constexpr (WRITE_RESIDUAL) {
+        // Codes 0-6 are reconstructed bit-exactly. Code 7 is the only lossy
+        // case: the decoder replaces the original near-zero value with zero.
+        // All input values are already resident in reg_in, so the dense input
+        // buffer can now be reused for the next error-feedback residual.
+        uint32_t seven_mask = b0 & b1 & b2;
+        int elem_in_work = my_real_n_block * ELEMS_PER_BLOCK + tid * PACK;
+        if (elem_in_work < my_orig) {
+            int valid = min(PACK, my_orig - elem_in_work);
+            __nv_bfloat16* residual = input + my_input_off + elem_in_work;
+            #pragma unroll
+            for (int j = 0; j < PACK; ++j) {
+                if (((seven_mask >> j) & 1u) == 0) {
+                    reg_in[j] = __ushort_as_bfloat16(0);
+                }
+            }
+            if (aligned && valid == PACK) {
+                #pragma unroll
+                for (int off = 0; off < PACK; off += 8) {
+                    *reinterpret_cast<float4*>(residual + off) =
+                        *reinterpret_cast<float4*>(reg_in + off);
+                }
+            } else {
+                for (int j = 0; j < valid; ++j) {
+                    residual[j] = reg_in[j];
+                }
+            }
+        }
     }
 }
 
@@ -552,16 +582,24 @@ void hopper_compress_split_store_pad_api_8(
     unsigned char* staging, unsigned char* zero_output,
     int* n_8, int* orig_n_8, int* zero_count_8, int* bases_in,
     float* zero_threshold,
-    int padded_n_total, int n_works)
+    int padded_n_total, int n_works, bool write_residual)
 {
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     int blocks = padded_n_total / ELEMS_PER_BLOCK;
     cudaMemsetAsync(zero_count_8, 0, n_works * sizeof(int), stream);
     if (blocks == 0) return;
 
-    hopper_compress_split_store_pad_kernel<false><<<blocks, BLOCK_SIZE, 0, stream>>>(
-        input, output, staging, n_8, orig_n_8, zero_count_8,
-        bases_in, zero_threshold, n_works);
+    if (write_residual) {
+        hopper_compress_split_store_pad_kernel<false, true><<<
+            blocks, BLOCK_SIZE, 0, stream>>>(
+            input, output, staging, n_8, orig_n_8, zero_count_8,
+            bases_in, zero_threshold, n_works);
+    } else {
+        hopper_compress_split_store_pad_kernel<false, false><<<
+            blocks, BLOCK_SIZE, 0, stream>>>(
+            input, output, staging, n_8, orig_n_8, zero_count_8,
+            bases_in, zero_threshold, n_works);
+    }
 
     size_t smem = COPY_CHUNK;
     cudaFuncSetAttribute(hopper_copy_zero_kernel,
@@ -592,7 +630,7 @@ void hopper2_compress_split_store_pad_api_8(
     unsigned char* staging, unsigned char* zero_output,
     int* n_8, int* orig_n_8, int* zero_count_8, int* bases_in,
     float* zero_threshold,
-    int padded_n_total, int n_works)
+    int padded_n_total, int n_works, bool write_residual)
 {
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     int blocks = padded_n_total / ELEMS_PER_BLOCK;
@@ -600,10 +638,17 @@ void hopper2_compress_split_store_pad_api_8(
     if (blocks == 0) return;
 
     size_t reuse_smem = ELEMS_PER_BLOCK * sizeof(unsigned char);
-    hopper_compress_split_store_pad_kernel<true><<<
-        blocks, BLOCK_SIZE, reuse_smem, stream>>>(
-        input, output, staging, n_8, orig_n_8, zero_count_8,
-        bases_in, zero_threshold, n_works);
+    if (write_residual) {
+        hopper_compress_split_store_pad_kernel<true, true><<<
+            blocks, BLOCK_SIZE, reuse_smem, stream>>>(
+            input, output, staging, n_8, orig_n_8, zero_count_8,
+            bases_in, zero_threshold, n_works);
+    } else {
+        hopper_compress_split_store_pad_kernel<true, false><<<
+            blocks, BLOCK_SIZE, reuse_smem, stream>>>(
+            input, output, staging, n_8, orig_n_8, zero_count_8,
+            bases_in, zero_threshold, n_works);
+    }
 
     size_t smem = COPY_CHUNK;
     cudaFuncSetAttribute(hopper_copy_zero_kernel,

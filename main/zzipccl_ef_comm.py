@@ -21,8 +21,8 @@ class ZZipCCLEfReduceScatter:
 
     The residual is kept in BF16 and has the same number of elements as the
     local reduce-scatter input.  Before compression, the previous residual is
-    added to the new input.  The exact stream sent to peers is then decoded
-    locally so the next residual is ``compensated_input - decoded_input``.
+    added to the new input.  Compression then replaces that buffer in-place
+    with the error introduced by the lossy code-7 near-zero representation.
     """
 
     def __init__(
@@ -127,9 +127,9 @@ class ZZipCCLEfReduceScatter:
 
         input = input_tensor.contiguous().view(-1)
         residual = self._get_residual(input_tensor, world_size)
-        # Reuse the persistent residual allocation as the compensated input:
-        # e_t <- x_t + e_t.  It is converted back to the next residual after
-        # locally decoding the compressed representation below.
+        # Reuse the persistent residual allocation as the compensated input.
+        # The compression kernel overwrites it with the next residual after
+        # loading the compensated values into registers.
         with torch.no_grad():
             residual.add_(input)
         compensated_input = residual
@@ -183,10 +183,11 @@ class ZZipCCLEfReduceScatter:
             zero_threshold,
             padded_total_numel,
             world_size,
+            write_residual=True,
         )
 
-        # Start the fixed-size exchanges first so the local residual decode
-        # can overlap with communication on NCCL's stream.
+        # The compression kernel has already written the next residual back to
+        # compensated_input, so only the received streams need decompression.
         count_work = dist.all_to_all_single(
             zero_counts_recv,
             zero_counts_send,
@@ -201,24 +202,6 @@ class ZZipCCLEfReduceScatter:
             group=group,
             async_op=True,
         )
-
-        # Reconstruct exactly what this rank is sending and retain only the
-        # quantization error for the next call.  Both this decode and NCCL work
-        # are asynchronous, allowing them to overlap where the backend permits.
-        local_decompressed = torch.empty_like(compensated_input)
-        self._decompress(
-            det_send,
-            zero_send,
-            n_8,
-            zero_counts_send,
-            local_decompressed,
-            shard_numel,
-            world_size,
-        )
-        with torch.no_grad():
-            residual.sub_(local_decompressed)
-        local_decompressed.record_stream(torch.cuda.current_stream(device))
-        del local_decompressed
 
         count_work.wait()
         send_counts = zero_counts_send.cpu().tolist()
