@@ -32,7 +32,11 @@ def install():
     ext_args += ["-DUSE_GPU"]
 
     nvcc_flags = [
-        "-arch=sm_89",
+        "-gencode=arch=compute_80,code=sm_80",
+        "-gencode=arch=compute_86,code=sm_86",
+        "-gencode=arch=compute_89,code=sm_89",
+        "-gencode=arch=compute_90,code=sm_90",
+        "-gencode=arch=compute_90,code=compute_90",
         "-std=c++17",
         "--expt-relaxed-constexpr",
         "-O3",
