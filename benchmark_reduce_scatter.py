@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--shard-numel",
         type=int,
-        default=1_048_576,
+        default=4_194_304,
         help="number of output elements per rank (default: 1048576)",
     )
     parser.add_argument("--warmup", type=int, default=5)
@@ -157,13 +157,13 @@ def global_accuracy(
     rtol: float,
     group: dist.ProcessGroup,
 ) -> Accuracy:
-    diff = actual.float() - expected
+    diff = actual - expected
     max_abs = diff.abs().max()
     abs_sum = diff.abs().sum(dtype=torch.float32)
     square_sum = diff.float().square().sum()
     reference_square_sum = expected.float().square().sum()
     passed = torch.tensor(
-        int(torch.allclose(actual.float(), expected, atol=atol, rtol=rtol)),
+        int(torch.allclose(actual, expected, atol=atol, rtol=rtol)),
         dtype=torch.int32,
         device=actual.device,
     )

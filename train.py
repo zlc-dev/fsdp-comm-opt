@@ -138,7 +138,7 @@ def main():
     fsdp_config = dict(
         reshard_after_forward=True,
         offload_policy=CPUOffloadPolicy() if args.cpu_offload else None,
-        mp_policy=MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=torch.float32),
+        mp_policy=MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype),
     )
 
     if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
