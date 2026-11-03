@@ -1,8 +1,10 @@
 #include "ATen/core/TensorBody.h"
 #include <torch/extension.h>
+#include <pybind11/stl.h>
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <limits>
+#include <optional>
 
 void hopper_compress_split_store_pad_api_8(
     __nv_bfloat16* input,
@@ -120,7 +122,7 @@ void hopper_compress(
     int padded_n_total,
     int n_works,
     bool write_residual,
-    torch::Tensor residual,
+    std::optional<torch::Tensor> residual,
     int residual_work)
 {
     check_tensor(input, "input", torch::kBFloat16);
@@ -161,16 +163,20 @@ void hopper_compress(
 
     __nv_bfloat16* residual_ptr = nullptr;
     if (write_residual) {
-        check_tensor(residual, "residual", torch::kBFloat16);
-        check_same_device(residual, input, "residual");
+        TORCH_CHECK(residual.has_value(),
+                    "residual is required when write_residual is true");
+        const torch::Tensor& residual_tensor = *residual;
+        check_tensor(residual_tensor, "residual", torch::kBFloat16);
+        check_same_device(residual_tensor, input, "residual");
         TORCH_CHECK(
             residual_work >= 0 && residual_work < n_works,
             "residual_work must be in [0, n_works)");
         TORCH_CHECK(
-            residual.numel() * static_cast<int64_t>(n_works) == input.numel(),
+            residual_tensor.numel() * static_cast<int64_t>(n_works)
+                == input.numel(),
             "residual must contain exactly one input shard");
         residual_ptr = reinterpret_cast<__nv_bfloat16*>(
-            residual.data_ptr<torch::BFloat16>());
+            residual_tensor.data_ptr<torch::BFloat16>());
     }
 
     hopper_compress_split_store_pad_api_8(
@@ -248,7 +254,7 @@ void hopper2_compress(
     int padded_n_total,
     int n_works,
     bool write_residual,
-    torch::Tensor residual,
+    std::optional<torch::Tensor> residual,
     int residual_work)
 {
     check_tensor(input, "input", torch::kBFloat16);
@@ -289,16 +295,20 @@ void hopper2_compress(
 
     __nv_bfloat16* residual_ptr = nullptr;
     if (write_residual) {
-        check_tensor(residual, "residual", torch::kBFloat16);
-        check_same_device(residual, input, "residual");
+        TORCH_CHECK(residual.has_value(),
+                    "residual is required when write_residual is true");
+        const torch::Tensor& residual_tensor = *residual;
+        check_tensor(residual_tensor, "residual", torch::kBFloat16);
+        check_same_device(residual_tensor, input, "residual");
         TORCH_CHECK(
             residual_work >= 0 && residual_work < n_works,
             "residual_work must be in [0, n_works)");
         TORCH_CHECK(
-            residual.numel() * static_cast<int64_t>(n_works) == input.numel(),
+            residual_tensor.numel() * static_cast<int64_t>(n_works)
+                == input.numel(),
             "residual must contain exactly one input shard");
         residual_ptr = reinterpret_cast<__nv_bfloat16*>(
-            residual.data_ptr<torch::BFloat16>());
+            residual_tensor.data_ptr<torch::BFloat16>());
     }
 
     hopper2_compress_split_store_pad_api_8(
@@ -380,7 +390,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         py::arg("padded_n_total"),
         py::arg("n_works"),
         py::arg("write_residual") = false,
-        py::arg("residual") = torch::Tensor(),
+        py::arg("residual") = py::none(),
         py::arg("residual_work") = -1);
     module.def(
         "hopper_decompress",
@@ -402,7 +412,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         py::arg("padded_n_total"),
         py::arg("n_works"),
         py::arg("write_residual") = false,
-        py::arg("residual") = torch::Tensor(),
+        py::arg("residual") = py::none(),
         py::arg("residual_work") = -1);
     module.def(
         "hopper2_decompress",

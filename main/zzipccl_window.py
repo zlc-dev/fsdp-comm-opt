@@ -3,14 +3,16 @@ import torch
 
 ISQRT2 = 1 / math.sqrt(2)
 
+
 def adaptive_window_base_tensor(
     std: torch.Tensor,
     zero_threshold: float,
     base: torch.Tensor,
     window_size: int,
 ) -> torch.Tensor:
-    if window_size < 0:
-        raise ValueError("window_size must be non-negative")
+    """Select a window base from finite, integer-valued ``base`` entries."""
+    if window_size <= 0:
+        raise ValueError("window_size must be positive")
 
     zt = abs(zero_threshold)
     if zt == 0.0:
@@ -21,25 +23,25 @@ def adaptive_window_base_tensor(
     hi = math.ceil(log2_zt)
 
     if lo == hi:
-        candidate = torch.full_like(base, hi)
-    else:
-        k = ISQRT2 / std
+        return torch.clamp_min(base, hi)
 
-        def tensor_cover(candidate_base: int) -> torch.Tensor:
-            start = 2.0 ** candidate_base
-            end = 2.0 ** (candidate_base + window_size)
-            if zt > end:
-                return torch.erf(zt * k)
-            if zt > start:
-                return torch.erf(end * k)
-            return torch.erf(zt * k) + torch.erf(end * k) - torch.erf(start * k)
+    k = ISQRT2 / std
+    start_hi = 2.0 ** hi
+    end_lo = 2.0 ** (lo + window_size)
+    end_hi = 2.0 * end_lo
 
-        cover_lo = tensor_cover(lo)
-        cover_hi = tensor_cover(hi)
-        candidate = torch.where(
-            cover_lo > cover_hi,
-            torch.full_like(base, lo),
-            torch.full_like(base, hi),
+    # lo < log2(zt) < hi and window_size > 0, so evaluate the four
+    # unique cover terms in one batched erf call.
+    erf_zt, erf_end_lo, erf_start_hi, erf_end_hi = torch.erf(
+        torch.stack(
+            (zt * k, end_lo * k, start_hi * k, end_hi * k),
+            dim=0,
         )
+    ).unbind(0)
+    cover_lo = erf_end_lo
+    cover_hi = erf_zt + erf_end_hi - erf_start_hi
+    # hi == lo + 1 here. Subtracting the predicate avoids materializing
+    # two full_like candidate tensors.
+    candidate = hi - (cover_lo > cover_hi).to(base.dtype)
 
-    return torch.where(base >= hi, base, candidate)
+    return torch.maximum(base, candidate)
