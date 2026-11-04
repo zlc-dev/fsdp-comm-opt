@@ -207,20 +207,14 @@ class ZZipCCLReduceScatter:
     def __init__(
         self,
         min_compress_numel: int = 0,
-        reuse: bool = False,
         zero_threshold: float = 2**-12,
     ):
         if not math.isfinite(zero_threshold) or zero_threshold < 0:
             raise ValueError("zero_threshold must be a finite, non-negative value")
         self.min_compress_numel = min_compress_numel
-        self.reuse = reuse
         self.zero_threshold = zero_threshold
-        self._compress = (
-            zzip.hopper2_compress if reuse else zzip.hopper_compress
-        )
-        self._decompress = (
-            zzip.hopper2_decompress if reuse else zzip.hopper_decompress
-        )
+        self._compress = zzip.hopper_compress
+        self._decompress = zzip.hopper_decompress
 
     def allocate(self, size, *, dtype, device):
         return torch.empty(size, dtype=dtype, device=device)

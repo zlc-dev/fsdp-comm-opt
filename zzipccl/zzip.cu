@@ -102,7 +102,7 @@ __global__ void hopper_copy_zero_kernel(
     }
 }
 
-template <bool REUSE_CODE7_SLOTS, bool WRITE_RESIDUAL>
+template <bool WRITE_RESIDUAL>
 __global__ void hopper_compress_split_store_pad_kernel(
     const rptr<__nv_bfloat16> input,
     rptr<__nv_bfloat16> residual,
@@ -116,8 +116,6 @@ __global__ void hopper_compress_split_store_pad_kernel(
     int residual_work,
     int n_works)
 {
-    extern __shared__ __align__(128) uint8_t reuse_smem[];
-
     const int tid     = threadIdx.x;
     const int lane    = tid % WARP_SIZE;
     const int warp_id = tid / WARP_SIZE;
@@ -165,6 +163,8 @@ __global__ void hopper_compress_split_store_pad_kernel(
     }
     __syncthreads();
     const unsigned short zero_threshold_bits = s_zero_threshold_bits;
+    const float zero_quant_step = __bfloat162float(
+        __ushort_as_bfloat16(zero_threshold_bits)) / 127.0f;
     int my_i = s_i;
     if (my_i < 0) return;
     int my_real_n_block = s_real_n_block;
@@ -229,6 +229,15 @@ __global__ void hopper_compress_split_store_pad_kernel(
         unsigned int code = (e >= best_i && e < best_i + 6) ? (e - best_i + 1) : 0u;
         unsigned short magnitude_bits = p[j] & 0x7FFFu;
         code = (code == 0u && magnitude_bits < zero_threshold_bits) ? 7u : code;
+        if (code == 7u) {
+            // Code 7 does not need the BF16 exponent. Reuse its byte as a
+            // sign-magnitude uniform quantizer over [0, zero_threshold].
+            float magnitude = fabsf(__bfloat162float(reg_in[j]));
+            int quantized = __float2int_rn(magnitude / zero_quant_step);
+            quantized = min(quantized, 127);
+            sm_local[j] = static_cast<unsigned char>(
+                ((p[j] >> 8) & 0x80u) | quantized);
+        }
         b0 |= ((code >> 0) & 1u) << j;
         b1 |= ((code >> 1) & 1u) << j;
         b2 |= ((code >> 2) & 1u) << j;
@@ -237,51 +246,6 @@ __global__ void hopper_compress_split_store_pad_kernel(
     uint32_t zero_mask = ~b0 & ~b1 & ~b2;
     uint32_t overflow_mask = zero_mask;
     unsigned active_mask = __activemask();
-    if constexpr (REUSE_CODE7_SLOTS) {
-        uint32_t seven_mask = b0 & b1 & b2;
-        int zero_count = __popc(zero_mask);
-        int seven_count = __popc(seven_mask);
-        int zero_scan = zero_count;
-        int seven_scan = seven_count;
-        #pragma unroll
-        for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
-            int prev_zero = __shfl_up_sync(active_mask, zero_scan, offset);
-            int prev_seven = __shfl_up_sync(active_mask, seven_scan, offset);
-            if (lane >= offset) {
-                zero_scan += prev_zero;
-                seven_scan += prev_seven;
-            }
-        }
-        int zero_prefix = zero_scan - zero_count;
-        int seven_prefix = seven_scan - seven_count;
-        int warp_pair_count = min(
-            __shfl_sync(active_mask, zero_scan, WARP_SIZE - 1),
-            __shfl_sync(active_mask, seven_scan, WARP_SIZE - 1));
-        unsigned char* warp_pair_exp =
-            reuse_smem + warp_id * WARP_SIZE * PACK;
-
-        uint32_t m = zero_mask;
-        int rank = zero_prefix;
-        while (m && rank < warp_pair_count) {
-            int bit = __ffs(m) - 1;
-            warp_pair_exp[rank++] = exp_local[bit];
-            m &= (m - 1);
-        }
-        __syncwarp(active_mask);
-
-        m = seven_mask;
-        rank = seven_prefix;
-        while (m && rank < warp_pair_count) {
-            int bit = __ffs(m) - 1;
-            sm_local[bit] = warp_pair_exp[rank++];
-            m &= (m - 1);
-        }
-
-        int paired_here = min(max(warp_pair_count - zero_prefix, 0), zero_count);
-        for (int i = 0; i < paired_here; ++i) {
-            overflow_mask &= (overflow_mask - 1);
-        }
-    }
 
     // --- prefix-sum of outlier spill counts ---
     int thread_spill_count = __popc(overflow_mask);
@@ -327,12 +291,18 @@ __global__ void hopper_compress_split_store_pad_kernel(
     bitmap_b1[bmap_idx] = b1;
     bitmap_b2[bmap_idx] = b2;
 
-    // --- deterministic stream: block_offsets ---
+    // --- deterministic stream: block_offsets + packed work metadata ---
+    // The final uint32 stores:
+    //   bits  7:0  = best_i (its exponent-window base needs only 8 bits)
+    //   bits 22:8  = zero_threshold_bits (sign-cleared BF16 needs 15 bits)
+    //   bits 31:23 = reserved
     int* block_offsets_out = reinterpret_cast<int*>(bitmap_b2 + my_local_n_8 / 32);
     if (warp_id == 0 && lane == 0) {
         block_offsets_out[my_real_n_block] = block_base_global;
         if (my_real_n_block == 0)
-            block_offsets_out[my_current_n_block] = best_i;
+            block_offsets_out[my_current_n_block] =
+                (best_i & 0xFF)
+                | ((static_cast<int>(zero_threshold_bits) & 0x7FFF) << 8);
     }
 
     // --- outlier stream ---
@@ -346,8 +316,8 @@ __global__ void hopper_compress_split_store_pad_kernel(
     }
 
     if constexpr (WRITE_RESIDUAL) {
-        // Codes 0-6 are reconstructed bit-exactly. Code 7 is the only lossy
-        // case. Retain errors for only one destination shard so persistent
+        // Codes 0-6 are reconstructed bit-exactly. Retain the code-7
+        // quantization error for only one destination shard so persistent
         // residual storage is 1 / n_works of the dense input.
         if (my_i == residual_work) {
             uint32_t seven_mask = b0 & b1 & b2;
@@ -357,7 +327,19 @@ __global__ void hopper_compress_split_store_pad_kernel(
                 int valid = min(PACK, my_orig - elem_in_work);
                 #pragma unroll
                 for (int j = 0; j < PACK; ++j) {
-                    if (((seven_mask >> j) & 1u) == 0) {
+                    if ((seven_mask >> j) & 1u) {
+                        unsigned char quantized = sm_local[j];
+                        float reconstructed =
+                            static_cast<float>(quantized & 0x7Fu)
+                            * zero_quant_step;
+                        if ((quantized & 0x80u) && (quantized & 0x7Fu))
+                            reconstructed = -reconstructed;
+                        __nv_bfloat16 reconstructed_bf16 =
+                            __float2bfloat16_rn(reconstructed);
+                        reg_in[j] = __float2bfloat16_rn(
+                            __bfloat162float(reg_in[j])
+                            - __bfloat162float(reconstructed_bf16));
+                    } else {
                         reg_in[j] = __ushort_as_bfloat16(0);
                     }
                 }
@@ -383,7 +365,6 @@ __global__ void hopper_compress_split_store_pad_kernel(
 // a compacted output (skipping per-work padding), so no post-decompress
 // copy is needed. Each work's valid data starts at i * orig_ele_num.
 // =========================================================
-template <bool REUSE_CODE7_SLOTS>
 __global__ void hopper_decompress_split_store_unpad_kernel(
     const rptr<unsigned char> compressed_input,
     const rptr<unsigned char> zero_input,
@@ -395,7 +376,6 @@ __global__ void hopper_decompress_split_store_unpad_kernel(
 {
     extern __shared__ __align__(128) uint8_t smem_raw[];
     unsigned char* smem_nce = smem_raw;
-    unsigned char* reuse_smem = smem_raw + ELEMS_PER_BLOCK;
 
     const int tid     = threadIdx.x;
     const int lane    = tid % WARP_SIZE;
@@ -440,7 +420,12 @@ __global__ void hopper_decompress_split_store_unpad_kernel(
             const int* block_offsets = reinterpret_cast<const int*>(bm_b2 + local_n_8 / 32);
             const unsigned char* nce_ptr = zero_arr;
 
-            int best_i = block_offsets[current_n_block];
+            int metadata = block_offsets[current_n_block];
+            int best_i = metadata & 0xFF;
+            unsigned short zero_threshold_bits =
+                static_cast<unsigned short>((metadata >> 8) & 0x7FFF);
+            float zero_quant_step = __bfloat162float(
+                __ushort_as_bfloat16(zero_threshold_bits)) / 127.0f;
 
             int bmap_idx = real_n_block * BLOCK_SIZE + tid;
             uint32_t lb0 = bm_b0[bmap_idx];
@@ -453,48 +438,9 @@ __global__ void hopper_decompress_split_store_unpad_kernel(
             *reinterpret_cast<float4*>(local_sm + 16)  = *reinterpret_cast<const float4*>(my_sm + 16);
 
             uint32_t zero_mask = ~lb0 & ~lb1 & ~lb2;
-            uint32_t seven_mask = lb0 & lb1 & lb2;
             int thread_zero_count = __popc(zero_mask);
             unsigned active_mask = __activemask();
-            int warp_zero_prefix = 0;
-            int warp_pair_count = 0;
-            int thread_paired_count = 0;
-            if constexpr (REUSE_CODE7_SLOTS) {
-                int thread_seven_count = __popc(seven_mask);
-                int zero_scan = thread_zero_count;
-                int seven_scan = thread_seven_count;
-                #pragma unroll
-                for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
-                    int prev_zero =
-                        __shfl_up_sync(active_mask, zero_scan, offset);
-                    int prev_seven =
-                        __shfl_up_sync(active_mask, seven_scan, offset);
-                    if (lane >= offset) {
-                        zero_scan += prev_zero;
-                        seven_scan += prev_seven;
-                    }
-                }
-                warp_zero_prefix = zero_scan - thread_zero_count;
-                int warp_seven_prefix = seven_scan - thread_seven_count;
-                warp_pair_count = min(
-                    __shfl_sync(active_mask, zero_scan, WARP_SIZE - 1),
-                    __shfl_sync(active_mask, seven_scan, WARP_SIZE - 1));
-                thread_paired_count = min(
-                    max(warp_pair_count - warp_zero_prefix, 0),
-                    thread_zero_count);
-
-                unsigned char* warp_pair_exp =
-                    reuse_smem + warp_id * WARP_SIZE * PACK;
-                uint32_t m = seven_mask;
-                int rank = warp_seven_prefix;
-                while (m && rank < warp_pair_count) {
-                    int bit = __ffs(m) - 1;
-                    warp_pair_exp[rank++] = local_sm[bit];
-                    m &= (m - 1);
-                }
-                __syncwarp(active_mask);
-            }
-            int thread_spill_count = thread_zero_count - thread_paired_count;
+            int thread_spill_count = thread_zero_count;
 
             int val2 = thread_spill_count;
             #pragma unroll
@@ -544,23 +490,15 @@ __global__ void hopper_decompress_split_store_unpad_kernel(
 
                 unsigned char exp_val;
                 if (code == 0) {
-                    if constexpr (REUSE_CODE7_SLOTS) {
-                        int warp_rank = warp_zero_prefix + zero_rank;
-                        if (warp_rank < warp_pair_count) {
-                            const unsigned char* warp_pair_exp =
-                                reuse_smem + warp_id * WARP_SIZE * PACK;
-                            exp_val = warp_pair_exp[warp_rank];
-                        } else {
-                            exp_val = smem_nce[
-                                thread_exp_start + zero_rank - thread_paired_count];
-                        }
-                    } else {
-                        exp_val = smem_nce[thread_exp_start + zero_rank];
-                    }
+                    exp_val = smem_nce[thread_exp_start + zero_rank];
                     ++zero_rank;
                 } else if (code == 7u) {
-                    exp_val = 0;
-                    lsm = 0;
+                    float reconstructed =
+                        static_cast<float>(lsm & 0x7Fu) * zero_quant_step;
+                    if ((lsm & 0x80u) && (lsm & 0x7Fu))
+                        reconstructed = -reconstructed;
+                    out_reg[bit] = __float2bfloat16_rn(reconstructed);
+                    continue;
                 } else {
                     exp_val = static_cast<unsigned char>(best_i + (code - 1));
                 }
@@ -608,12 +546,12 @@ void hopper_compress_split_store_pad_api_8(
     if (blocks == 0) return;
 
     if (write_residual) {
-        hopper_compress_split_store_pad_kernel<false, true><<<
+        hopper_compress_split_store_pad_kernel<true><<<
             blocks, BLOCK_SIZE, 0, stream>>>(
             input, residual, output, staging, n_8, orig_n_8, zero_count_8,
             bases_in, zero_threshold, residual_work, n_works);
     } else {
-        hopper_compress_split_store_pad_kernel<false, false><<<
+        hopper_compress_split_store_pad_kernel<false><<<
             blocks, BLOCK_SIZE, 0, stream>>>(
             input, residual, output, staging, n_8, orig_n_8, zero_count_8,
             bases_in, zero_threshold, residual_work, n_works);
@@ -636,58 +574,9 @@ void hopper_decompress_split_store_unpad_api_8(
     if (blocks == 0) return;
 
     size_t smem = ELEMS_PER_BLOCK * sizeof(unsigned char);
-    cudaFuncSetAttribute(hopper_decompress_split_store_unpad_kernel<false>,
+    cudaFuncSetAttribute(hopper_decompress_split_store_unpad_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem + 1024);
-    hopper_decompress_split_store_unpad_kernel<false><<<blocks, BLOCK_SIZE, smem, stream>>>(
-        compressed_input, zero_input, zero_count_8, n_8,
-        output, n_works, orig_ele_num);
-}
-
-void hopper2_compress_split_store_pad_api_8(
-    __nv_bfloat16* input, __nv_bfloat16* residual, unsigned char* output,
-    unsigned char* staging, unsigned char* zero_output,
-    int* n_8, int* orig_n_8, int* zero_count_8, int* bases_in,
-    float* zero_threshold,
-    int padded_n_total, int residual_work, int n_works, bool write_residual)
-{
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    int blocks = padded_n_total / ELEMS_PER_BLOCK;
-    cudaMemsetAsync(zero_count_8, 0, n_works * sizeof(int), stream);
-    if (blocks == 0) return;
-
-    size_t reuse_smem = ELEMS_PER_BLOCK * sizeof(unsigned char);
-    if (write_residual) {
-        hopper_compress_split_store_pad_kernel<true, true><<<
-            blocks, BLOCK_SIZE, reuse_smem, stream>>>(
-            input, residual, output, staging, n_8, orig_n_8, zero_count_8,
-            bases_in, zero_threshold, residual_work, n_works);
-    } else {
-        hopper_compress_split_store_pad_kernel<true, false><<<
-            blocks, BLOCK_SIZE, reuse_smem, stream>>>(
-            input, residual, output, staging, n_8, orig_n_8, zero_count_8,
-            bases_in, zero_threshold, residual_work, n_works);
-    }
-
-    size_t smem = COPY_CHUNK;
-    cudaFuncSetAttribute(hopper_copy_zero_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem + 1024);
-    hopper_copy_zero_kernel<<<blocks, COPY_BLK, smem, stream>>>(
-        staging, zero_output, n_8, zero_count_8, n_works);
-}
-
-void hopper2_decompress_split_store_unpad_api_8(
-    unsigned char* compressed_input, unsigned char* zero_input,
-    int* zero_count_8, int* n_8, __nv_bfloat16* output,
-    int padded_n_total, int orig_ele_num, int n_works)
-{
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    int blocks = padded_n_total / ELEMS_PER_BLOCK;
-    if (blocks == 0) return;
-
-    size_t smem = 2 * ELEMS_PER_BLOCK * sizeof(unsigned char);
-    cudaFuncSetAttribute(hopper_decompress_split_store_unpad_kernel<true>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem + 1024);
-    hopper_decompress_split_store_unpad_kernel<true><<<blocks, BLOCK_SIZE, smem, stream>>>(
+    hopper_decompress_split_store_unpad_kernel<<<blocks, BLOCK_SIZE, smem, stream>>>(
         compressed_input, zero_input, zero_count_8, n_8,
         output, n_works, orig_ele_num);
 }
