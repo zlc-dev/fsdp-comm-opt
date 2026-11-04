@@ -284,6 +284,7 @@ def run(args: argparse.Namespace) -> bool:
     try:
         from main.zipccl_comm import ZipCCLReduceScatter
         from main.zzipccl_comm import ZZipCCLReduceScatter
+        from main.zzipccl_ef_comm import ZZipCCLEfReduceScatter
     except ImportError as error:
         raise RuntimeError(
             "failed to import the ZipCCL CUDA extensions; rebuild zipccl and "
@@ -312,6 +313,9 @@ def run(args: argparse.Namespace) -> bool:
     zzipccl = ZZipCCLReduceScatter(
         zero_threshold=args.zero_threshold,
     )
+    zzipccl_ef = ZZipCCLEfReduceScatter(
+        zero_threshold=args.zero_threshold,
+    )
     methods = (
         Method(
             "Native",
@@ -336,6 +340,13 @@ def run(args: argparse.Namespace) -> bool:
             zzipccl,
             args.compressed_atol,
             args.compressed_rtol,
+        ),
+        Method(
+            "ZZipCCL-EF",
+            zzipccl_ef,
+            args.compressed_atol,
+            args.compressed_rtol,
+            reset=zzipccl_ef.reset,
         ),
     )
 

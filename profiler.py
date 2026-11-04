@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent zzipccl/zipccl CUDA kernel and communication-size benchmark."""
+"""ZipCCL, ZZipCCL, and ZZipCCL-EF kernel and communication-size benchmark."""
 from __future__ import annotations
 
 import argparse
@@ -154,6 +154,36 @@ class ZZipCCLBenchmark(KernelBenchmark):
         return int(self.zero_count.item())
 
 
+class ZZipCCLEFBenchmark(ZZipCCLBenchmark):
+    name = "zzipccl-ef"
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.threshold = torch.tensor([1e-5], dtype=torch.float32, device=data.device)
+        self.residual = torch.zeros(
+            data.numel, dtype=torch.bfloat16, device=data.device
+        )
+
+    def compress(self):
+        d = self.data
+        zzip.hopper_compress(
+            d.input,
+            d.n_8,
+            d.orig_n_8,
+            self.bases,
+            self.compressed,
+            self.staging,
+            self.zero,
+            self.zero_count,
+            self.threshold,
+            d.padded,
+            1,
+            write_residual=True,
+            residual=self.residual,
+            residual_work=0,
+        )
+
+
 class ZipCCLBenchmark(KernelBenchmark):
     name = "zipccl"
 
@@ -224,7 +254,11 @@ def main():
     data = make_input(args.numel, device)
     print(f"GPU: {torch.cuda.get_device_name(device)}")
     print(f"elements: {args.numel} (padded: {data.padded})")
-    for benchmark in (ZZipCCLBenchmark(data), ZipCCLBenchmark(data)):
+    for benchmark in (
+        ZZipCCLBenchmark(data),
+        ZZipCCLEFBenchmark(data),
+        ZipCCLBenchmark(data),
+    ):
         comp, decomp, error = benchmark.run(args.warmup, args.iters, args.repeats)
         comm = benchmark.communication_stats()
         print(
