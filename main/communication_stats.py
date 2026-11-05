@@ -9,6 +9,7 @@ import torch.distributed as dist
 @dataclass(frozen=True)
 class CommunicationStats:
     outlier_count: int = 0
+    element_count: int = 0
     actual_bytes: int = 0
     original_bytes: int = 0
 
@@ -23,11 +24,13 @@ class CommunicationStatsCollector:
         self,
         *,
         outlier_count: int,
+        element_count: int,
         actual_bytes: int,
         original_bytes: int,
     ) -> None:
         self._stats = CommunicationStats(
             outlier_count=self._stats.outlier_count + int(outlier_count),
+            element_count=self._stats.element_count + int(element_count),
             actual_bytes=self._stats.actual_bytes + int(actual_bytes),
             original_bytes=self._stats.original_bytes + int(original_bytes),
         )
@@ -58,6 +61,7 @@ class NativeReduceScatter:
         original_bytes = input_tensor.numel() * input_tensor.element_size()
         self.stats.record(
             outlier_count=0,
+            element_count=input_tensor.numel(),
             actual_bytes=original_bytes,
             original_bytes=original_bytes,
         )

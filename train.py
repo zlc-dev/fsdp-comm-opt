@@ -280,7 +280,7 @@ def main():
         args.profiler_wait + args.profiler_warmup + args.profiler_active
     )
     profiler_finished = False
-    cumulative_communication_stats = [0, 0, 0]
+    cumulative_actual_bytes = 0
     max_steps_reached = state["global_step"] >= args.max_step
     if max_steps_reached:
         LOGGER.info(
@@ -365,6 +365,7 @@ def main():
                         stats_tensor = torch.tensor(
                             [
                                 local_stats.outlier_count,
+                                local_stats.element_count,
                                 local_stats.actual_bytes,
                                 local_stats.original_bytes,
                             ],
@@ -373,13 +374,7 @@ def main():
                         )
                         dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
                         global_communication_stats = stats_tensor.cpu().tolist()
-                        cumulative_communication_stats = [
-                            total + value
-                            for total, value in zip(
-                                cumulative_communication_stats,
-                                global_communication_stats,
-                            )
-                        ]
+                        cumulative_actual_bytes += global_communication_stats[2]
                     tok_per_step = world_size * args.batch_size * args.seq_length
                     ms_per_step = sum(t.avg_elapsed_ms() for t in timers.values())
                     info = {
@@ -399,12 +394,16 @@ def main():
                         },
                     }
                     if global_communication_stats is not None:
-                        outliers, actual_bytes, original_bytes = (
+                        outliers, element_count, actual_bytes, original_bytes = (
                             global_communication_stats
                         )
                         info.update(
                             {
-                                "communication/outlier_count": outliers,
+                                "communication/outlier_ratio": (
+                                    outliers / element_count
+                                    if element_count > 0
+                                    else 0.0
+                                ),
                                 "communication/actual_bytes": actual_bytes,
                                 "communication/original_bytes": original_bytes,
                                 "communication/compression_ratio": (
@@ -412,14 +411,8 @@ def main():
                                     if actual_bytes > 0
                                     else 0.0
                                 ),
-                                "communication/cumulative_outlier_count": (
-                                    cumulative_communication_stats[0]
-                                ),
                                 "communication/cumulative_actual_bytes": (
-                                    cumulative_communication_stats[1]
-                                ),
-                                "communication/cumulative_original_bytes": (
-                                    cumulative_communication_stats[2]
+                                    cumulative_actual_bytes
                                 ),
                             }
                         )
@@ -649,7 +642,7 @@ def _get_parser() -> argparse.ArgumentParser:
         "--compression-stats",
         action="store_true",
         help=(
-            "collect outlier counts and actual communication bytes; "
+            "collect outlier ratios and communication bytes; "
             "metrics are included in W&B logs when --wandb is enabled"
         ),
     )

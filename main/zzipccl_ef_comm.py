@@ -102,6 +102,7 @@ class ZZipCCLEfReduceScatter:
                 original_bytes = input_tensor.numel() * input_tensor.element_size()
                 self.stats.record(
                     outlier_count=0,
+                    element_count=input_tensor.numel(),
                     actual_bytes=original_bytes,
                     original_bytes=original_bytes,
                 )
@@ -217,6 +218,7 @@ class ZZipCCLEfReduceScatter:
         if self.stats is not None:
             self.stats.record(
                 outlier_count=sum(int(count) for count in send_counts),
+                element_count=input_tensor.numel(),
                 actual_bytes=(
                     world_size * det_bytes
                     + world_size * zero_counts_send.element_size()

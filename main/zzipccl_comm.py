@@ -64,6 +64,7 @@ class ZZipCCLAllGather:
                 original_bytes = input_tensor.numel() * input_tensor.element_size()
                 self.stats.record(
                     outlier_count=0,
+                    element_count=input_tensor.numel(),
                     actual_bytes=original_bytes,
                     original_bytes=original_bytes,
                 )
@@ -147,6 +148,7 @@ class ZZipCCLAllGather:
         if self.stats is not None:
             self.stats.record(
                 outlier_count=int(zero_count_local.item()),
+                element_count=orig_numel,
                 actual_bytes=det_bytes + 4 + max_zero_bytes,
                 original_bytes=orig_numel * input_tensor.element_size(),
             )
@@ -268,6 +270,7 @@ class ZZipCCLReduceScatter:
                 original_bytes = input_tensor.numel() * input_tensor.element_size()
                 self.stats.record(
                     outlier_count=0,
+                    element_count=input_tensor.numel(),
                     actual_bytes=original_bytes,
                     original_bytes=original_bytes,
                 )
@@ -375,6 +378,7 @@ class ZZipCCLReduceScatter:
         if self.stats is not None:
             self.stats.record(
                 outlier_count=sum(int(count) for count in send_counts),
+                element_count=input_tensor.numel(),
                 actual_bytes=(
                     world_size * det_bytes
                     + world_size * zero_counts_send.element_size()
