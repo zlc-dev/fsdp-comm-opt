@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 
 from zipccl import hopper_fastzip2
+from main.communication_stats import CommunicationStatsCollector
 
 _ELEMS_PER_BLOCK = 128 * 32
 
@@ -10,8 +11,13 @@ def _align(value: int, alignment: int = 128) -> int:
 
 class ZipCCLAllGather:
 
-    def __init__(self, min_compress_numel: int = 0):
+    def __init__(
+        self,
+        min_compress_numel: int = 0,
+        stats: CommunicationStatsCollector | None = None,
+    ):
         self.min_compress_numel = min_compress_numel
+        self.stats = stats
 
     def allocate(self, size, *, dtype, device):
         return torch.empty(size, dtype=dtype, device=device)
@@ -34,6 +40,13 @@ class ZipCCLAllGather:
             or not input_tensor.is_cuda
             or not output_tensor.is_cuda
         ):
+            if self.stats is not None:
+                original_bytes = input_tensor.numel() * input_tensor.element_size()
+                self.stats.record(
+                    outlier_count=0,
+                    actual_bytes=original_bytes,
+                    original_bytes=original_bytes,
+                )
             return dist.all_gather_into_tensor(
                 output_tensor,
                 input_tensor,
@@ -112,6 +125,13 @@ class ZipCCLAllGather:
         aligned_zero_counts = [_align(int(count)) for count in zero_counts_cpu]
         local_zero_bytes = aligned_zero_counts[dist.get_rank(group)]
         max_zero_bytes = max(max(aligned_zero_counts), 1)
+
+        if self.stats is not None:
+            self.stats.record(
+                outlier_count=int(zero_count_local.item()),
+                actual_bytes=det_bytes + 4 + max_zero_bytes,
+                original_bytes=orig_numel * input_tensor.element_size(),
+            )
 
         zero_send = torch.empty(max_zero_bytes, dtype=torch.uint8, device=device)
         if local_zero_bytes > 0:
@@ -202,8 +222,13 @@ class ZipCCLReduceScatter:
     float32 gradient reduction does not accumulate in bfloat16.
     """
 
-    def __init__(self, min_compress_numel: int = 0):
+    def __init__(
+        self,
+        min_compress_numel: int = 0,
+        stats: CommunicationStatsCollector | None = None,
+    ):
         self.min_compress_numel = min_compress_numel
+        self.stats = stats
 
     def allocate(self, size, *, dtype, device):
         return torch.empty(size, dtype=dtype, device=device)
@@ -238,6 +263,13 @@ class ZipCCLReduceScatter:
             or not output_tensor.is_cuda
             or not self._supported_op(op)
         ):
+            if self.stats is not None:
+                original_bytes = input_tensor.numel() * input_tensor.element_size()
+                self.stats.record(
+                    outlier_count=0,
+                    actual_bytes=original_bytes,
+                    original_bytes=original_bytes,
+                )
             return dist.reduce_scatter_tensor(
                 output_tensor,
                 input_tensor,
@@ -328,6 +360,17 @@ class ZipCCLReduceScatter:
         zero_send_splits = [_align(int(count)) for count in send_counts]
         zero_recv_splits = [_align(int(count)) for count in recv_counts]
         zero_recv_numel = sum(zero_recv_splits)
+
+        if self.stats is not None:
+            self.stats.record(
+                outlier_count=sum(int(count) for count in send_counts),
+                actual_bytes=(
+                    world_size * det_bytes
+                    + world_size * zero_counts_send.element_size()
+                    + sum(zero_send_splits)
+                ),
+                original_bytes=input_tensor.numel() * input_tensor.element_size(),
+            )
         zero_recv = torch.empty(
             max(zero_recv_numel, 1), dtype=torch.uint8, device=device
         )

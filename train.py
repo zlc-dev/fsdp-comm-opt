@@ -39,6 +39,10 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEm
 from main.zipccl_comm import ZipCCLAllGather, ZipCCLReduceScatter
 from main.zzipccl_comm import ZZipCCLAllGather, ZZipCCLReduceScatter
 from main.zzipccl_ef_comm import ZZipCCLEfReduceScatter
+from main.communication_stats import (
+    CommunicationStatsCollector,
+    NativeReduceScatter,
+)
 
 def reset_rope(self: LlamaRotaryEmbedding):
     rope_init_fn = getattr(self, "rope_init_fn", None)
@@ -66,24 +70,39 @@ LlamaRotaryEmbedding.reset_parameters = reset_rope
 
 LOGGER = logging.getLogger(__name__)
 
-def set_custom_all_gather(m: FSDPModule, args: argparse.Namespace):
-    if args.quantize_name == "zzipccl":
+def set_custom_all_gather(
+    m: FSDPModule,
+    args: argparse.Namespace,
+    communication_stats: CommunicationStatsCollector | None,
+):
+    if args.quantize and args.quantize_name == "zzipccl":
         # m.set_custom_all_gather(
         #     ZZipCCLAllGather(zero_threshold=1e-3)
         # )
         m.set_custom_reduce_scatter(
-            ZZipCCLReduceScatter(zero_threshold=1e-6)
+            ZZipCCLReduceScatter(
+                zero_threshold=1e-5,
+                stats=communication_stats,
+            )
         )
-    elif args.quantize_name == "zzipccl-ef":
+    elif args.quantize and args.quantize_name == "zzipccl-ef":
         # m.set_custom_all_gather(
         #     ZZipCCLAllGather(zero_threshold=1e-3)
         # )
         m.set_custom_reduce_scatter(
-            ZZipCCLEfReduceScatter(zero_threshold=1e-6)
+            ZZipCCLEfReduceScatter(
+                zero_threshold=1e-5,
+                stats=communication_stats,
+            )
         )
-    else:
+    elif args.quantize:
         # m.set_custom_all_gather(ZipCCLAllGather())
-        m.set_custom_reduce_scatter(ZipCCLReduceScatter())
+        m.set_custom_reduce_scatter(
+            ZipCCLReduceScatter(stats=communication_stats)
+        )
+    elif communication_stats is not None:
+        m.set_custom_reduce_scatter(NativeReduceScatter(communication_stats))
+
 
 @record
 def main():
@@ -126,6 +145,9 @@ def main():
 
     dtype = torch.bfloat16
     torch.manual_seed(args.seed)
+    communication_stats = (
+        CommunicationStatsCollector() if args.compression_stats else None
+    )
 
     # NOTE: meta device will not allocate any memory
     model: torch.nn.Module
@@ -153,8 +175,8 @@ def main():
     for decoder in layers:
         fsdp_module = fully_shard(decoder, **fsdp_config)
         fsdp_layers.append(fsdp_module)
-        if(args.quantize):
-            set_custom_all_gather(fsdp_module, args)
+        if args.quantize or communication_stats is not None:
+            set_custom_all_gather(fsdp_module, args, communication_stats)
 
     if args.forward_prefetch_distance > 0:
         for i, fsdp_module in enumerate(fsdp_layers):
@@ -165,8 +187,8 @@ def main():
                 fsdp_module.set_modules_to_forward_prefetch(prefetch_modules)
 
     fsdp_model = fully_shard(model, **fsdp_config)
-    if(args.quantize):
-        set_custom_all_gather(fsdp_model, args)
+    if args.quantize or communication_stats is not None:
+        set_custom_all_gather(fsdp_model, args, communication_stats)
 
     model.to_empty(device="cpu" if args.cpu_offload else device)
     model.apply(
@@ -258,6 +280,7 @@ def main():
         args.profiler_wait + args.profiler_warmup + args.profiler_active
     )
     profiler_finished = False
+    cumulative_communication_stats = [0, 0, 0]
     max_steps_reached = state["global_step"] >= args.max_step
     if max_steps_reached:
         LOGGER.info(
@@ -336,6 +359,27 @@ def main():
                         state["running_loss"], dtype=torch.float64, device=device
                     )
                     dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+                    global_communication_stats = None
+                    if communication_stats is not None:
+                        local_stats = communication_stats.pop()
+                        stats_tensor = torch.tensor(
+                            [
+                                local_stats.outlier_count,
+                                local_stats.actual_bytes,
+                                local_stats.original_bytes,
+                            ],
+                            dtype=torch.int64,
+                            device=device,
+                        )
+                        dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+                        global_communication_stats = stats_tensor.cpu().tolist()
+                        cumulative_communication_stats = [
+                            total + value
+                            for total, value in zip(
+                                cumulative_communication_stats,
+                                global_communication_stats,
+                            )
+                        ]
                     tok_per_step = world_size * args.batch_size * args.seq_length
                     ms_per_step = sum(t.avg_elapsed_ms() for t in timers.values())
                     info = {
@@ -354,6 +398,31 @@ def main():
                             for k, timer in timers.items()
                         },
                     }
+                    if global_communication_stats is not None:
+                        outliers, actual_bytes, original_bytes = (
+                            global_communication_stats
+                        )
+                        info.update(
+                            {
+                                "communication/outlier_count": outliers,
+                                "communication/actual_bytes": actual_bytes,
+                                "communication/original_bytes": original_bytes,
+                                "communication/compression_ratio": (
+                                    original_bytes / actual_bytes
+                                    if actual_bytes > 0
+                                    else 0.0
+                                ),
+                                "communication/cumulative_outlier_count": (
+                                    cumulative_communication_stats[0]
+                                ),
+                                "communication/cumulative_actual_bytes": (
+                                    cumulative_communication_stats[1]
+                                ),
+                                "communication/cumulative_original_bytes": (
+                                    cumulative_communication_stats[2]
+                                ),
+                            }
+                        )
 
                     LOGGER.info(info)
                     if wandb_run is not None:
@@ -378,6 +447,11 @@ def main():
                                         "curr_resv_gb",
                                         "peak_resv_gb",
                                     )
+                                },
+                                **{
+                                    key: value
+                                    for key, value in info.items()
+                                    if key.startswith("communication/")
                                 },
                             },
                             step=state["global_step"],
@@ -570,6 +644,14 @@ def _get_parser() -> argparse.ArgumentParser:
         "--wandb",
         action="store_true",
         help="log training metrics to Weights & Biases",
+    )
+    parser.add_argument(
+        "--compression-stats",
+        action="store_true",
+        help=(
+            "collect outlier counts and actual communication bytes; "
+            "metrics are included in W&B logs when --wandb is enabled"
+        ),
     )
     parser.add_argument("--wandb-project", default="fsdp-comm-opt")
     parser.add_argument("--wandb-entity", default=None)

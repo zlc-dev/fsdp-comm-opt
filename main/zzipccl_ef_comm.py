@@ -6,6 +6,7 @@ import torch.distributed as dist
 from zzipccl import zzip
 
 from main.zzipccl_window import adaptive_window_base_tensor
+from main.communication_stats import CommunicationStatsCollector
 
 _ELEMS_PER_BLOCK = 128 * 32
 _EXPONENT_BIAS = 127
@@ -29,11 +30,13 @@ class ZZipCCLEfReduceScatter:
         self,
         min_compress_numel: int = 0,
         zero_threshold: float = 2**-12,
+        stats: CommunicationStatsCollector | None = None,
     ):
         if not math.isfinite(zero_threshold) or zero_threshold < 0:
             raise ValueError("zero_threshold must be a finite, non-negative value")
         self.min_compress_numel = min_compress_numel
         self.zero_threshold = zero_threshold
+        self.stats = stats
         self._compress = zzip.hopper_compress
         self._decompress = zzip.hopper_decompress
         self._residual: torch.Tensor | None = None
@@ -95,6 +98,13 @@ class ZZipCCLEfReduceScatter:
             or not output_tensor.is_cuda
             or not self._supported_op(op)
         ):
+            if self.stats is not None:
+                original_bytes = input_tensor.numel() * input_tensor.element_size()
+                self.stats.record(
+                    outlier_count=0,
+                    actual_bytes=original_bytes,
+                    original_bytes=original_bytes,
+                )
             return dist.reduce_scatter_tensor(
                 output_tensor,
                 input_tensor,
@@ -203,6 +213,17 @@ class ZZipCCLEfReduceScatter:
         zero_send_splits = [_align(int(count)) for count in send_counts]
         zero_recv_splits = [_align(int(count)) for count in recv_counts]
         zero_recv_numel = sum(zero_recv_splits)
+
+        if self.stats is not None:
+            self.stats.record(
+                outlier_count=sum(int(count) for count in send_counts),
+                actual_bytes=(
+                    world_size * det_bytes
+                    + world_size * zero_counts_send.element_size()
+                    + sum(zero_send_splits)
+                ),
+                original_bytes=input_tensor.numel() * input_tensor.element_size(),
+            )
         zero_recv = torch.empty(
             max(zero_recv_numel, 1), dtype=torch.uint8, device=device
         )
