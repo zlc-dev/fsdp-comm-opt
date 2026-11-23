@@ -1,7 +1,11 @@
 import ctypes
+import logging
 import os
 import time
 from functools import lru_cache
+from itertools import count
+from queue import Empty, Queue
+from threading import Thread
 
 import torch
 import torch.distributed as dist
@@ -13,6 +17,50 @@ _ELEMS_PER_BLOCK = 128 * 32
 _NCCL_BFLOAT16 = 9
 _NCCL_SUM = 0
 _NCCL_IN_PROGRESS = 7
+LOGGER = logging.getLogger(__name__)
+_ZIPCCL_CALL_IDS = count(1)
+
+
+class _ZipCCLEventTrace:
+    def __init__(self):
+        self.events = Queue()
+        Thread(target=self._poll, name="zipccl-events", daemon=True).start()
+
+    def record(self, stream, call, phase):
+        event = stream.record_event()
+        LOGGER.info("ZipCCL event recorded %s phase=%s", call, phase)
+        self.events.put((event, call, phase, time.monotonic() + 5))
+
+    def _poll(self):
+        pending = []
+        while True:
+            try:
+                pending.append(self.events.get(timeout=0.1 if pending else None))
+                while True:
+                    pending.append(self.events.get_nowait())
+            except Empty:
+                pass
+
+            remaining = []
+            for event, call, phase, deadline in pending:
+                try:
+                    complete = event.query()
+                except RuntimeError:
+                    LOGGER.exception("ZipCCL event query failed %s phase=%s", call, phase)
+                    continue
+                if complete:
+                    LOGGER.info("ZipCCL event complete %s phase=%s", call, phase)
+                    continue
+                if deadline is not None and time.monotonic() >= deadline:
+                    LOGGER.warning("ZipCCL event still pending %s phase=%s", call, phase)
+                    deadline = None
+                remaining.append((event, call, phase, deadline))
+            pending = remaining
+
+
+@lru_cache(maxsize=1)
+def _zipccl_event_trace():
+    return _ZipCCLEventTrace()
 
 
 @lru_cache(maxsize=1)
@@ -45,7 +93,15 @@ def _zipccl_nccl():
 class NCCLZipCCLReduceScatter:
     """Enqueue BF16 SUM with a per-input PyTorch sigma estimate by default."""
 
-    def __init__(self, sigma: float | None = None):
+    def __init__(
+        self,
+        sigma: float | None = None,
+        *,
+        null_sigma: bool = False,
+        trace_events: bool = False,
+    ):
+        self._null_sigma = null_sigma
+        self._trace_events = trace_events
         self._sigma = None if sigma is None else ctypes.c_float(sigma)
         if self._sigma is not None and (
             sigma < 0 or not self._sigma.value < float("inf")
@@ -98,6 +154,14 @@ class NCCLZipCCLReduceScatter:
                     raise RuntimeError("ZipCCL could not obtain the NCCL communicator")
 
             stream = torch.cuda.current_stream(device)
+            if self._trace_events:
+                tracer = _zipccl_event_trace()
+                call = (
+                    f"call={next(_ZIPCCL_CALL_IDS)} recvcount={output_tensor.numel()} "
+                    f"comm={comm:#x} stream={stream.cuda_stream:#x} "
+                    f"sigma_mode={'null' if self._null_sigma else 'device'}"
+                )
+                tracer.record(stream, call, "before_sigma")
             input_tensor = input_tensor.contiguous()
             if self._sigma is None:
                 std = input_tensor.std(unbiased=False).float()
@@ -114,7 +178,12 @@ class NCCLZipCCLReduceScatter:
                 comm, stream.cuda_stream,
             )
             # Sigma is allocated on this stream and held through NCCL submission.
-            result = lib.ncclZipCCLReduceScatterWithSigma(*args, sigma.data_ptr())
+            LOGGER.debug("ZipCCL NCCL call: recvcount=%d", output_tensor.numel())
+            if self._trace_events:
+                tracer.record(stream, call, "before")
+            sigma_ptr = None if self._null_sigma else sigma.data_ptr()
+            result = lib.ncclZipCCLReduceScatterWithSigma(*args, sigma_ptr)
+            LOGGER.debug("ZipCCL NCCL returned %d", result)
 
             if result == _NCCL_IN_PROGRESS:
                 # Wait for NCCL to submit the work before FSDP records its event.
@@ -131,6 +200,9 @@ class NCCLZipCCLReduceScatter:
             if result != 0:
                 error = lib.ncclGetErrorString(result).decode()
                 raise RuntimeError(f"NCCL ZipCCL reduce-scatter failed ({result}): {error}")
+            if self._trace_events:
+                tracer.record(stream, call, "after")
+            LOGGER.debug("ZipCCL NCCL submission complete")
 
 
 def _align(value: int, alignment: int = 128) -> int:

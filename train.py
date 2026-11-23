@@ -1,6 +1,7 @@
 import argparse
 from contextlib import contextmanager
 import contextlib
+import faulthandler
 import json
 import math
 import multiprocessing
@@ -98,7 +99,12 @@ def set_custom_all_gather(
             )
         )
     elif args.quantize and args.quantize_name == "zipccl-nccl":
-        m.set_custom_reduce_scatter(NCCLZipCCLReduceScatter())
+        m.set_custom_reduce_scatter(
+            NCCLZipCCLReduceScatter(
+                null_sigma=args.zipccl_nccl_null_sigma,
+                trace_events=args.trace_zipccl_events,
+            )
+        )
     elif args.quantize:
         # m.set_custom_all_gather(ZipCCLAllGather())
         m.set_custom_reduce_scatter(
@@ -290,6 +296,7 @@ def main():
     profiler_finished = False
     cumulative_actual_bytes = 0
     max_steps_reached = state["global_step"] >= args.max_step
+    trace_first_step = args.trace_first_step and not max_steps_reached
     if max_steps_reached:
         LOGGER.info(
             "Global step %d has already reached max step %d; skipping training",
@@ -326,13 +333,21 @@ def main():
             if state["epoch_step"] > 0:
                 progress_bar.update(state["epoch_step"])
 
+            if trace_first_step:
+                faulthandler.dump_traceback_later(60, repeat=True)
+                logging.getLogger("main.zipccl_comm").setLevel(logging.DEBUG)
+                LOGGER.info("First step: creating data iterator")
             dataloader.sampler.set_epoch(state["epoch"])
             batches = iter(dataloader)
 
             for i_step in range(len(dataloader)):
+                if trace_first_step:
+                    LOGGER.info("First step: model.unshard")
                 # NOTE: prefetches the first layer
                 model.unshard()
 
+                if trace_first_step:
+                    LOGGER.info("First step: loading batch")
                 with timers["data"], torch.no_grad():
                     batch = next(batches)
                     batch = {k: v.to(device=device) for k, v in batch.items()}
@@ -341,13 +356,19 @@ def main():
                     # NOTE: for resuming
                     continue
 
+                if trace_first_step:
+                    LOGGER.info("First step: forward")
                 with timers["forward"], torch.profiler.record_function("STEP::forward"):
                     outputs = model(**batch)
                     del batch
 
+                if trace_first_step:
+                    LOGGER.info("First step: backward")
                 with timers["backward"], torch.profiler.record_function("STEP::backward"):
                     outputs.loss.backward()
 
+                if trace_first_step:
+                    LOGGER.info("First step: optimizer update")
                 with timers["update"], torch.profiler.record_function("STEP::update"):
                     optimizer.step()
                     lr_scheduler.step()
@@ -360,6 +381,11 @@ def main():
                 state["global_step"] += 1
                 state["epoch_step"] += 1
                 state["running_loss"] += outputs.loss.item()
+                if trace_first_step:
+                    faulthandler.cancel_dump_traceback_later()
+                    logging.getLogger("main.zipccl_comm").setLevel(logging.NOTSET)
+                    LOGGER.info("First step: complete")
+                    trace_first_step = False
                 progress_bar.update(1)
 
                 if state["global_step"] % args.log_freq == 0:
@@ -634,6 +660,21 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profiler-wait", default=100, type=int)
     parser.add_argument("--profiler-warmup", default=5, type=int)
     parser.add_argument("--profiler-active", default=3, type=int)
+    parser.add_argument(
+        "--trace-first-step",
+        action="store_true",
+        help="log first-step stages and dump Python stacks every 60 seconds until it finishes",
+    )
+    parser.add_argument(
+        "--zipccl-nccl-null-sigma",
+        action="store_true",
+        help="pass a null sigma pointer in zipccl-nccl mode",
+    )
+    parser.add_argument(
+        "--trace-zipccl-events",
+        action="store_true",
+        help="query CUDA events immediately before and after each NCCL ZipCCL call",
+    )
     parser.add_argument("--forward-prefetch-distance", default=1, type=int)
     parser.add_argument("-q", "--quantize", default=False, action="store_true")
     parser.add_argument(
