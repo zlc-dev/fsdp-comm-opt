@@ -342,9 +342,9 @@ class ZipCCLReduceScatter:
     """ZipCCL reduce-scatter implemented as compressed all-to-all + reduce.
 
     ``input_tensor`` is laid out as one equally sized shard per destination
-    rank. Each shard is compressed independently, exchanged with its
-    destination, decompressed there, and finally reduced over all source
-    ranks. This is the reduce-scatter construction used by ZipCCL.
+    rank. The split-store exchange follows ZipA2A.a2a_v_split_store:
+    exchange the fixed payload, outlier counts, and variable outlier payload.
+    Decode the received shards in source-rank order and reduce them locally.
 
     The compressed representation is bfloat16. The local reduction is carried
     out in float32 before copying to ``output_tensor`` so that FSDP's usual
@@ -423,8 +423,6 @@ class ZipCCLReduceScatter:
             + n_blocks * 4
             + 4
         )
-        det_split_sizes = [det_bytes] * world_size
-
         input = input_tensor.contiguous().view(-1)
         n_8 = torch.full(
             (world_size,),
@@ -478,27 +476,27 @@ class ZipCCLReduceScatter:
         det_work = dist.all_to_all_single(
             det_recv,
             det_send,
-            output_split_sizes=det_split_sizes,
-            input_split_sizes=det_split_sizes,
             group=group,
             async_op=True,
         )
 
         count_work.wait()
-        send_counts = zero_counts_send.cpu().tolist()
-        recv_counts = zero_counts_recv.cpu().tolist()
-        zero_send_splits = [_align(int(count)) for count in send_counts]
-        zero_recv_splits = [_align(int(count)) for count in recv_counts]
+        counts = torch.cat((zero_counts_send, zero_counts_recv)).cpu().tolist()
+        send_counts = counts[:world_size]
+        recv_counts = counts[world_size:]
+        zero_send_splits = [_align(count) for count in send_counts]
+        zero_recv_splits = [_align(count) for count in recv_counts]
+        zero_send_numel = sum(zero_send_splits)
         zero_recv_numel = sum(zero_recv_splits)
 
         if self.stats is not None:
             self.stats.record(
-                outlier_count=sum(int(count) for count in send_counts),
+                outlier_count=sum(send_counts),
                 element_count=input_tensor.numel(),
                 actual_bytes=(
                     world_size * det_bytes
                     + world_size * zero_counts_send.element_size()
-                    + sum(zero_send_splits)
+                    + zero_send_numel
                 ),
                 original_bytes=input_tensor.numel() * input_tensor.element_size(),
             )
@@ -508,7 +506,7 @@ class ZipCCLReduceScatter:
 
         zero_work = dist.all_to_all_single(
             zero_recv[:zero_recv_numel],
-            zero_send[:sum(zero_send_splits)],
+            zero_send[:zero_send_numel],
             output_split_sizes=zero_recv_splits,
             input_split_sizes=zero_send_splits,
             group=group,
