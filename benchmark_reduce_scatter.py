@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Distributed correctness and performance benchmark for reduce-scatter.
+r"""Distributed correctness and performance benchmark for reduce-scatter.
 
-Launch on every visible GPU with:
+Preload the ZipCCL-enabled NCCL build and launch on every visible GPU:
 
-    torchrun --standalone --nproc-per-node=gpu benchmark_reduce_scatter.py
+    LD_PRELOAD=/path/to/zipccl/libnccl.so.2 \
+        torchrun --standalone --nproc-per-node=gpu benchmark_reduce_scatter.py
 """
 
 from __future__ import annotations
@@ -52,11 +53,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument(
-        "--zipccl-nccl",
-        action="store_true",
-        help="compare native reduce-scatter with the preloaded NCCL ZipCCL implementation",
-    )
     parser.add_argument("--mean", type=float, default=0.0)
     parser.add_argument("--std", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=1234)
@@ -287,12 +283,9 @@ def run(args: argparse.Namespace) -> bool:
     dtype = torch.bfloat16
 
     try:
-        if args.zipccl_nccl:
-            from main.zipccl_comm import NCCLZipCCLReduceScatter
-        else:
-            from main.zipccl_comm import ZipCCLReduceScatter
-            from main.zzipccl_comm import ZZipCCLReduceScatter
-            from main.zzipccl_ef_comm import ZZipCCLEfReduceScatter
+        from main.zipccl_comm import NCCLZipCCLReduceScatter, ZipCCLReduceScatter
+        from main.zzipccl_comm import ZZipCCLReduceScatter
+        from main.zzipccl_ef_comm import ZZipCCLEfReduceScatter
     except ImportError as error:
         raise RuntimeError(
             "failed to import the ZipCCL CUDA extensions; rebuild zipccl and "
@@ -317,52 +310,52 @@ def run(args: argparse.Namespace) -> bool:
     torch.cuda.synchronize(device)
     torch.cuda.empty_cache()
 
-    native_method = Method(
-        "Native",
-        native_reduce_scatter,
-        args.native_atol,
-        args.native_rtol,
+    zipccl = ZipCCLReduceScatter()
+    zzipccl = ZZipCCLReduceScatter(
+        zero_threshold=args.zero_threshold,
     )
-    if args.zipccl_nccl:
-        methods = (
-            native_method,
-            Method(
-                "ZipCCL-NCCL",
-                NCCLZipCCLReduceScatter(),
-                args.compressed_atol,
-                args.compressed_rtol,
-            ),
-        )
-    else:
-        zzipccl_ef = ZZipCCLEfReduceScatter(zero_threshold=args.zero_threshold)
-        methods = (
-            native_method,
-            Method(
-                "All2All+Reduce",
-                native_all_to_all_reduce,
-                args.native_atol,
-                args.native_rtol,
-            ),
-            Method(
-                "ZipCCL",
-                ZipCCLReduceScatter(),
-                args.compressed_atol,
-                args.compressed_rtol,
-            ),
-            Method(
-                "ZZipCCL",
-                ZZipCCLReduceScatter(zero_threshold=args.zero_threshold),
-                args.compressed_atol,
-                args.compressed_rtol,
-            ),
-            Method(
-                "ZZipCCL-EF",
-                zzipccl_ef,
-                args.compressed_atol,
-                args.compressed_rtol,
-                reset=zzipccl_ef.reset,
-            ),
-        )
+    zzipccl_ef = ZZipCCLEfReduceScatter(
+        zero_threshold=args.zero_threshold,
+    )
+    methods = (
+        Method(
+            "Native",
+            native_reduce_scatter,
+            args.native_atol,
+            args.native_rtol,
+        ),
+        Method(
+            "All2All+Reduce",
+            native_all_to_all_reduce,
+            args.native_atol,
+            args.native_rtol,
+        ),
+        Method(
+            "ZipCCL",
+            zipccl,
+            args.compressed_atol,
+            args.compressed_rtol,
+        ),
+        Method(
+            "ZipCCL-NCCL",
+            NCCLZipCCLReduceScatter(),
+            args.compressed_atol,
+            args.compressed_rtol,
+        ),
+        Method(
+            "ZZipCCL",
+            zzipccl,
+            args.compressed_atol,
+            args.compressed_rtol,
+        ),
+        Method(
+            "ZZipCCL-EF",
+            zzipccl_ef,
+            args.compressed_atol,
+            args.compressed_rtol,
+            reset=zzipccl_ef.reset,
+        ),
+    )
 
     if rank == 0:
         print("\nCorrectness against all-gather reference:")
@@ -372,8 +365,6 @@ def run(args: argparse.Namespace) -> bool:
         )
     all_passed = True
     for method in methods:
-        if rank == 0 and args.zipccl_nccl:
-            print(f"Checking {method.name}", flush=True)
         accuracy = check_method(
             method, input_tensor, expected, args.shard_numel, group
         )
