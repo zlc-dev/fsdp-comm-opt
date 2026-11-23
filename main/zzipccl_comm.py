@@ -32,12 +32,14 @@ class ZZipCCLAllGather:
         self.reuse = reuse
         self.zero_threshold = zero_threshold
         self.stats = stats
-        self._compress = (
-            zzip.hopper2_compress if reuse else zzip.hopper_compress
-        )
-        self._decompress = (
-            zzip.hopper2_decompress if reuse else zzip.hopper_decompress
-        )
+        self._compress = zzip.hopper_compress
+        self._decompress = zzip.hopper_decompress
+        if reuse:
+            compress = getattr(zzip, "hopper2_compress", None)
+            decompress = getattr(zzip, "hopper2_decompress", None)
+            if compress is not None and decompress is not None:
+                self._compress = compress
+                self._decompress = decompress
 
     def allocate(self, size, *, dtype, device):
         return torch.empty(size, dtype=dtype, device=device)
@@ -54,11 +56,14 @@ class ZZipCCLAllGather:
         if (
             world_size == 1
             or async_op
+            or input_tensor.numel() == 0
             or input_tensor.numel() < self.min_compress_numel
+            or output_tensor.numel() != input_tensor.numel() * world_size
             or input_tensor.dtype != torch.bfloat16
             or output_tensor.dtype != torch.bfloat16
             or not input_tensor.is_cuda
-            or not output_tensor.is_cuda
+            or output_tensor.device != input_tensor.device
+            or not output_tensor.is_contiguous()
         ):
             if self.stats is not None:
                 original_bytes = input_tensor.numel() * input_tensor.element_size()
@@ -160,11 +165,12 @@ class ZZipCCLAllGather:
             )
 
         zero_recv = torch.empty(
-            (world_size, max_zero_bytes), dtype=torch.uint8, device=device
+            world_size * max_zero_bytes, dtype=torch.uint8, device=device
         )
         zero_work = dist.all_gather_into_tensor(
             zero_recv, zero_send, group=group, async_op=True
         )
+        zero_recv = zero_recv.view(world_size, max_zero_bytes)
 
         n_8_all = torch.full(
             (world_size,), padded_numel, dtype=torch.int32, device=device

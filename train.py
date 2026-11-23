@@ -36,7 +36,11 @@ import wandb
 # fixes for reset_parameters not existing
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
-from main.zipccl_comm import ZipCCLAllGather, ZipCCLReduceScatter
+from main.zipccl_comm import (
+    NCCLZipCCLReduceScatter,
+    ZipCCLAllGather,
+    ZipCCLReduceScatter,
+)
 from main.zzipccl_comm import ZZipCCLAllGather, ZZipCCLReduceScatter
 from main.zzipccl_ef_comm import ZZipCCLEfReduceScatter
 from main.communication_stats import (
@@ -76,9 +80,7 @@ def set_custom_all_gather(
     communication_stats: CommunicationStatsCollector | None,
 ):
     if args.quantize and args.quantize_name == "zzipccl":
-        # m.set_custom_all_gather(
-        #     ZZipCCLAllGather(zero_threshold=1e-3)
-        # )
+        m.set_custom_all_gather(ZZipCCLAllGather(zero_threshold=1e-3))
         m.set_custom_reduce_scatter(
             ZZipCCLReduceScatter(
                 zero_threshold=1e-5,
@@ -95,6 +97,8 @@ def set_custom_all_gather(
                 stats=communication_stats,
             )
         )
+    elif args.quantize and args.quantize_name == "zipccl-nccl":
+        m.set_custom_reduce_scatter(NCCLZipCCLReduceScatter())
     elif args.quantize:
         # m.set_custom_all_gather(ZipCCLAllGather())
         m.set_custom_reduce_scatter(
@@ -145,9 +149,11 @@ def main():
 
     dtype = torch.bfloat16
     torch.manual_seed(args.seed)
-    communication_stats = (
-        CommunicationStatsCollector() if args.compression_stats else None
-    )
+    collect_compression_stats = args.compression_stats
+    if collect_compression_stats and args.quantize and args.quantize_name == "zipccl-nccl":
+        LOGGER.warning("The NCCL ZipCCL API does not expose compression statistics.")
+        collect_compression_stats = False
+    communication_stats = CommunicationStatsCollector() if collect_compression_stats else None
 
     # NOTE: meta device will not allocate any memory
     model: torch.nn.Module
@@ -174,6 +180,7 @@ def main():
     fsdp_layers = []
     for decoder in layers:
         fsdp_module = fully_shard(decoder, **fsdp_config)
+        fsdp_module.set_force_sum_reduction_for_comms(True)
         fsdp_layers.append(fsdp_module)
         if args.quantize or communication_stats is not None:
             set_custom_all_gather(fsdp_module, args, communication_stats)
@@ -187,6 +194,7 @@ def main():
                 fsdp_module.set_modules_to_forward_prefetch(prefetch_modules)
 
     fsdp_model = fully_shard(model, **fsdp_config)
+    fsdp_model.set_force_sum_reduction_for_comms(True)
     if args.quantize or communication_stats is not None:
         set_custom_all_gather(fsdp_model, args, communication_stats)
 
@@ -630,7 +638,7 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("-q", "--quantize", default=False, action="store_true")
     parser.add_argument(
         "--quantize-name",
-        choices=("zipccl", "zzipccl", "zzipccl-ef"),
+        choices=("zipccl", "zipccl-nccl", "zzipccl", "zzipccl-ef"),
         default=None,
     )
     parser.add_argument(

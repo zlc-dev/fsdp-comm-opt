@@ -178,7 +178,7 @@ __global__ void hopper_compress_split_store_pad_kernel(
     // --- load this thread's PACK elements from dense input (zero-padded) ---
     __nv_bfloat16 __align__(16) reg_in[PACK];
     int base_in_work = my_real_n_block * ELEMS_PER_BLOCK + tid * PACK;
-    bool aligned = ((my_input_off & 7u) == 0);
+    bool aligned = (reinterpret_cast<uintptr_t>(input + my_input_off) & 15u) == 0;
     #pragma unroll
     for (int off = 0; off < PACK; off += 8) {
         int pad_idx = base_in_work + off;
@@ -433,7 +433,7 @@ __global__ void hopper_decompress_split_store_unpad_kernel(
             uint32_t lb2 = bm_b2[bmap_idx];
 
             const unsigned char* my_sm = sm_ptr + (real_n_block * BLOCK_SIZE + tid) * PACK;
-            unsigned char local_sm[PACK];
+            unsigned char __align__(16) local_sm[PACK];
             *reinterpret_cast<float4*>(local_sm)      = *reinterpret_cast<const float4*>(my_sm);
             *reinterpret_cast<float4*>(local_sm + 16)  = *reinterpret_cast<const float4*>(my_sm + 16);
 
@@ -477,7 +477,7 @@ __global__ void hopper_decompress_split_store_unpad_kernel(
             __syncthreads();
 
             int zero_rank = 0;
-            __nv_bfloat16 out_reg[PACK];
+            __nv_bfloat16 __align__(16) out_reg[PACK];
 
             #pragma unroll
             for (int bit = 0; bit < 32; ++bit) {
@@ -514,10 +514,8 @@ __global__ void hopper_decompress_split_store_unpad_kernel(
             int elem_in_work = real_n_block * ELEMS_PER_BLOCK + tid * PACK;
             __nv_bfloat16* out_ptr = output + (size_t)my_i * orig_ele_num + elem_in_work;
 
-            // float4 stores need 16B (=8 bf16) alignment. elem_in_work is a
-            // multiple of 8, so alignment is governed by (my_i*orig_ele_num)%8.
-            bool base_aligned = (((size_t)my_i * orig_ele_num) & 7u) == 0;
-            if (base_aligned && elem_in_work + PACK <= orig_ele_num) {
+            bool aligned = (reinterpret_cast<uintptr_t>(out_ptr) & 15u) == 0;
+            if (aligned && elem_in_work + PACK <= orig_ele_num) {
                 #pragma unroll
                 for (int off = 0; off < PACK; off += 8) {
                     *reinterpret_cast<float4*>(out_ptr + off) =

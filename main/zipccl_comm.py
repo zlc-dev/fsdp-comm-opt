@@ -1,3 +1,8 @@
+import ctypes
+import os
+import time
+from functools import lru_cache
+
 import torch
 import torch.distributed as dist
 
@@ -5,6 +10,128 @@ from zipccl import hopper_fastzip2
 from main.communication_stats import CommunicationStatsCollector
 
 _ELEMS_PER_BLOCK = 128 * 32
+_NCCL_BFLOAT16 = 9
+_NCCL_SUM = 0
+_NCCL_IN_PROGRESS = 7
+
+
+@lru_cache(maxsize=1)
+def _zipccl_nccl():
+    try:
+        # The communicator belongs to PyTorch's already-loaded NCCL.
+        lib = ctypes.CDLL("libnccl.so.2", mode=os.RTLD_NOLOAD)
+        reduce_scatter_with_sigma = lib.ncclZipCCLReduceScatterWithSigma
+    except (OSError, AttributeError) as exc:
+        raise RuntimeError(
+            "Start the process with the ZipCCL libnccl.so.2 build that accepts "
+            "a device sigma pointer in LD_PRELOAD."
+        ) from exc
+
+    reduce_scatter_with_sigma.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    reduce_scatter_with_sigma.restype = ctypes.c_int
+    lib.ncclCommGetAsyncError.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+    ]
+    lib.ncclCommGetAsyncError.restype = ctypes.c_int
+    lib.ncclGetErrorString.argtypes = [ctypes.c_int]
+    lib.ncclGetErrorString.restype = ctypes.c_char_p
+    return lib
+
+
+class NCCLZipCCLReduceScatter:
+    """Enqueue BF16 SUM with a per-input PyTorch sigma estimate by default."""
+
+    def __init__(self, sigma: float | None = None):
+        self._sigma = None if sigma is None else ctypes.c_float(sigma)
+        if self._sigma is not None and (
+            sigma < 0 or not self._sigma.value < float("inf")
+        ):
+            raise ValueError("sigma must be finite and nonnegative as a C float")
+
+    def allocate(self, size, *, dtype, device):
+        return torch.empty(size, dtype=dtype, device=device)
+
+    def __call__(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+        op=dist.ReduceOp.SUM,
+        async_op: bool = False,
+    ):
+        world_size = dist.get_world_size(group)
+        device = input_tensor.device
+        if (
+            world_size > 1
+            and not async_op
+            and op == dist.ReduceOp.SUM
+            and input_tensor.dtype == output_tensor.dtype == torch.bfloat16
+            and device.type == "cuda"
+            and output_tensor.device == device
+            and output_tensor.is_contiguous()
+            and output_tensor.numel() > 0
+            and input_tensor.numel() == output_tensor.numel() * world_size
+        ):
+            process_group = dist.group.WORLD if group is None else group
+            backend = process_group._get_backend(device)
+            if isinstance(backend, dist.ProcessGroupNCCL):
+                self._enqueue(output_tensor, input_tensor, backend)
+                return None
+
+        return dist.reduce_scatter_tensor(
+            output_tensor, input_tensor, group=group, op=op, async_op=async_op
+        )
+
+    def _enqueue(self, output_tensor, input_tensor, backend):
+        device = input_tensor.device
+        with torch.cuda.device(device):
+            lib = _zipccl_nccl()
+            comm = backend._comm_ptr()
+            if not comm:
+                backend.eager_connect_single_device(device)
+                comm = backend._comm_ptr()
+                if not comm:
+                    raise RuntimeError("ZipCCL could not obtain the NCCL communicator")
+
+            stream = torch.cuda.current_stream(device)
+            input_tensor = input_tensor.contiguous()
+            if self._sigma is None:
+                std = input_tensor.std(unbiased=False).float()
+                sigma = torch.nan_to_num(std, nan=1e-30, posinf=1e30, neginf=1e-30)
+            else:
+                sigma = torch.full(
+                    (), self._sigma.value, dtype=torch.float32, device=device
+                )
+            input_tensor.record_stream(stream)
+            output_tensor.record_stream(stream)
+            args = (
+                input_tensor.data_ptr(), output_tensor.data_ptr(),
+                output_tensor.numel(), _NCCL_BFLOAT16, _NCCL_SUM,
+                comm, stream.cuda_stream,
+            )
+            # Sigma is allocated on this stream and held through NCCL submission.
+            result = lib.ncclZipCCLReduceScatterWithSigma(*args, sigma.data_ptr())
+
+            if result == _NCCL_IN_PROGRESS:
+                # Wait for NCCL to submit the work before FSDP records its event.
+                deadline = time.monotonic() + backend.options._timeout.total_seconds()
+                state = ctypes.c_int(result)
+                while result == _NCCL_IN_PROGRESS:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Timed out enqueueing NCCL ZipCCL reduce-scatter")
+                    result = lib.ncclCommGetAsyncError(comm, ctypes.byref(state))
+                    if result == 0:
+                        result = state.value
+                    if result == _NCCL_IN_PROGRESS:
+                        time.sleep(0.001)
+            if result != 0:
+                error = lib.ncclGetErrorString(result).decode()
+                raise RuntimeError(f"NCCL ZipCCL reduce-scatter failed ({result}): {error}")
+
 
 def _align(value: int, alignment: int = 128) -> int:
     return ((value + alignment - 1) // alignment) * alignment
