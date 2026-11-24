@@ -18,6 +18,7 @@ def _align(value: int, alignment: int = 128) -> int:
 
 
 class ZZipCCLAllGather:
+    """Gather split-store BF16 payloads and decode directly into the output."""
 
     def __init__(
         self,
@@ -145,52 +146,48 @@ class ZZipCCLAllGather:
 
         count_work.wait()
         zero_counts_cpu = zero_counts.cpu().tolist()
-        aligned_zero_counts = [_align(int(count)) for count in zero_counts_cpu]
+        aligned_zero_counts = [_align(count) for count in zero_counts_cpu]
 
         rank = dist.get_rank(group)
-        max_zero_bytes = max(max(aligned_zero_counts), 1)
+        max_zero_bytes = max(aligned_zero_counts)
 
         if self.stats is not None:
             self.stats.record(
-                outlier_count=int(zero_count_local.item()),
+                outlier_count=zero_counts_cpu[rank],
                 element_count=orig_numel,
                 actual_bytes=det_bytes + 4 + max_zero_bytes,
                 original_bytes=orig_numel * input_tensor.element_size(),
             )
-        zero_send = torch.empty(max_zero_bytes, dtype=torch.uint8, device=device)
-        local_zero_bytes = aligned_zero_counts[rank]
-        if local_zero_bytes > 0:
-            zero_send[:local_zero_bytes].copy_(
-                zero_send_compact[:local_zero_bytes]
+        zero_recv = None
+        if max_zero_bytes:
+            zero_send_compact[zero_counts_cpu[rank]:max_zero_bytes].zero_()
+            zero_recv = torch.empty(
+                world_size * max_zero_bytes, dtype=torch.uint8, device=device
             )
-
-        zero_recv = torch.empty(
-            world_size * max_zero_bytes, dtype=torch.uint8, device=device
-        )
-        zero_work = dist.all_gather_into_tensor(
-            zero_recv, zero_send, group=group, async_op=True
-        )
-        zero_recv = zero_recv.view(world_size, max_zero_bytes)
+            zero_work = dist.all_gather_into_tensor(
+                zero_recv, zero_send_compact[:max_zero_bytes], group=group, async_op=True
+            )
 
         n_8_all = torch.full(
             (world_size,), padded_numel, dtype=torch.int32, device=device
         )
 
+        stream = torch.cuda.current_stream(device)
         det_work.wait()
-        zero_work.wait()
-
-        total_zero_bytes = sum(aligned_zero_counts)
-        zero_input = torch.empty(
-            max(total_zero_bytes, 1), dtype=torch.uint8, device=device
-        )
-
-        zero_offset = 0
-        for peer, zero_bytes in enumerate(aligned_zero_counts):
-            if zero_bytes > 0:
-                zero_input[zero_offset:zero_offset + zero_bytes].copy_(
-                    zero_recv[peer, :zero_bytes]
-                )
-                zero_offset += zero_bytes
+        if zero_recv is None:
+            zero_input = torch.empty(1, dtype=torch.uint8, device=device)
+        else:
+            zero_work.wait()
+            if sum(aligned_zero_counts) == zero_recv.numel():
+                zero_input = zero_recv
+            else:
+                zero_input = torch.cat([
+                    row[:size]
+                    for row, size in zip(
+                        zero_recv.view(world_size, max_zero_bytes), aligned_zero_counts
+                    )
+                ])
+            zero_recv.record_stream(stream)
 
         self._decompress(
             det_recv,
@@ -202,9 +199,9 @@ class ZZipCCLAllGather:
             world_size,
         )
 
-        stream = torch.cuda.current_stream(device)
         for tensor in (
             input_flat,
+            output_flat,
             n_8_local,
             orig_n_8_local,
             bases_in,
@@ -215,8 +212,6 @@ class ZZipCCLAllGather:
             zero_threshold,
             det_recv,
             zero_counts,
-            zero_send,
-            zero_recv,
             n_8_all,
             zero_input,
         ):
@@ -226,7 +221,10 @@ class ZZipCCLAllGather:
 
 
 class ZZipCCLReduceScatter:
-    """ZZipCCL reduce-scatter using compressed all-to-all and local reduce.
+    """Compressed all-to-all and local reduce, with optional sender error feedback.
+
+    Error feedback stores one BF16 residual shard per rank, for the destination
+    whose group rank matches the sender's.
     """
 
     def __init__(
@@ -234,6 +232,8 @@ class ZZipCCLReduceScatter:
         min_compress_numel: int = 0,
         zero_threshold: float = 2**-12,
         stats: CommunicationStatsCollector | None = None,
+        *,
+        error_feedback: bool = False,
     ):
         if not math.isfinite(zero_threshold) or zero_threshold < 0:
             raise ValueError("zero_threshold must be a finite, non-negative value")
@@ -242,6 +242,30 @@ class ZZipCCLReduceScatter:
         self.stats = stats
         self._compress = zzip.hopper_compress
         self._decompress = zzip.hopper_decompress
+        self.error_feedback = error_feedback
+        self._residual: torch.Tensor | None = None
+        self._residual_world_size: int | None = None
+
+    def reset(self) -> None:
+        """Discard accumulated compression error."""
+        self._residual = None
+        self._residual_world_size = None
+
+    def _get_residual(self, shard_tensor: torch.Tensor, world_size: int) -> torch.Tensor:
+        residual = self._residual
+        if (
+            residual is None
+            or residual.numel() != shard_tensor.numel()
+            or residual.device != shard_tensor.device
+            or residual.dtype != shard_tensor.dtype
+            or self._residual_world_size != world_size
+        ):
+            residual = torch.zeros(
+                shard_tensor.numel(), dtype=shard_tensor.dtype, device=shard_tensor.device
+            )
+            self._residual = residual
+            self._residual_world_size = world_size
+        return residual
 
     def allocate(self, size, *, dtype, device):
         return torch.empty(size, dtype=dtype, device=device)
@@ -302,8 +326,6 @@ class ZZipCCLReduceScatter:
             + n_blocks * 4
             + 4
         )
-        det_split_sizes = [det_bytes] * world_size
-
         input = input_tensor.contiguous().view(-1)
         n_8 = torch.full(
             (world_size,),
@@ -343,6 +365,15 @@ class ZZipCCLReduceScatter:
         )
         zero_send = torch.empty_like(zero_staging)
 
+        residual = None
+        compression_options = {}
+        if self.error_feedback:
+            residual = self._get_residual(output_tensor, world_size)
+            compression_options = {
+                "write_residual": True,
+                "residual": residual,
+                "residual_work": dist.get_rank(group),
+            }
         self._compress(
             input,
             n_8,
@@ -355,10 +386,10 @@ class ZZipCCLReduceScatter:
             zero_threshold,
             padded_total_numel,
             world_size,
+            **compression_options,
         )
 
-        # Start the fixed-size exchanges first so the local residual decode
-        # can overlap with communication on NCCL's stream.
+        # Submit the fixed payload before reading the outlier counts on the CPU.
         count_work = dist.all_to_all_single(
             zero_counts_recv,
             zero_counts_send,
@@ -368,27 +399,27 @@ class ZZipCCLReduceScatter:
         det_work = dist.all_to_all_single(
             det_recv,
             det_send,
-            output_split_sizes=det_split_sizes,
-            input_split_sizes=det_split_sizes,
             group=group,
             async_op=True,
         )
 
         count_work.wait()
-        send_counts = zero_counts_send.cpu().tolist()
-        recv_counts = zero_counts_recv.cpu().tolist()
-        zero_send_splits = [_align(int(count)) for count in send_counts]
-        zero_recv_splits = [_align(int(count)) for count in recv_counts]
+        counts = torch.cat((zero_counts_send, zero_counts_recv)).cpu().tolist()
+        send_counts = counts[:world_size]
+        recv_counts = counts[world_size:]
+        zero_send_splits = [_align(count) for count in send_counts]
+        zero_recv_splits = [_align(count) for count in recv_counts]
+        zero_send_numel = sum(zero_send_splits)
         zero_recv_numel = sum(zero_recv_splits)
 
         if self.stats is not None:
             self.stats.record(
-                outlier_count=sum(int(count) for count in send_counts),
+                outlier_count=sum(send_counts),
                 element_count=input_tensor.numel(),
                 actual_bytes=(
                     world_size * det_bytes
                     + world_size * zero_counts_send.element_size()
-                    + sum(zero_send_splits)
+                    + zero_send_numel
                 ),
                 original_bytes=input_tensor.numel() * input_tensor.element_size(),
             )
@@ -398,7 +429,7 @@ class ZZipCCLReduceScatter:
 
         zero_work = dist.all_to_all_single(
             zero_recv[:zero_recv_numel],
-            zero_send[:sum(zero_send_splits)],
+            zero_send[:zero_send_numel],
             output_split_sizes=zero_recv_splits,
             input_split_sizes=zero_send_splits,
             group=group,
@@ -429,6 +460,8 @@ class ZZipCCLReduceScatter:
         output_tensor.copy_(reduced.view(output_tensor.shape))
 
         stream = torch.cuda.current_stream(device)
+        if residual is not None:
+            residual.record_stream(stream)
         for tensor in (
             n_8,
             orig_n_8,

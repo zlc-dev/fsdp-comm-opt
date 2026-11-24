@@ -42,7 +42,6 @@ from main.zipccl_comm import (
     ZipCCLReduceScatter,
 )
 from main.zzipccl_comm import ZZipCCLAllGather, ZZipCCLReduceScatter
-from main.zzipccl_ef_comm import ZZipCCLEfReduceScatter
 from main.communication_stats import (
     CommunicationStatsCollector,
     NativeReduceScatter,
@@ -79,22 +78,13 @@ def set_custom_all_gather(
     args: argparse.Namespace,
     communication_stats: CommunicationStatsCollector | None,
 ):
-    if args.quantize and args.quantize_name == "zzipccl":
+    if args.quantize and args.quantize_name in ("zzipccl", "zzipccl-ef"):
         m.set_custom_all_gather(ZZipCCLAllGather(zero_threshold=1e-3))
         m.set_custom_reduce_scatter(
             ZZipCCLReduceScatter(
                 zero_threshold=1e-5,
                 stats=communication_stats,
-            )
-        )
-    elif args.quantize and args.quantize_name == "zzipccl-ef":
-        # m.set_custom_all_gather(
-        #     ZZipCCLAllGather(zero_threshold=1e-3)
-        # )
-        m.set_custom_reduce_scatter(
-            ZZipCCLEfReduceScatter(
-                zero_threshold=1e-5,
-                stats=communication_stats,
+                error_feedback=args.quantize_name == "zzipccl-ef",
             )
         )
     elif args.quantize and args.quantize_name == "zipccl-nccl":
